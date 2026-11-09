@@ -3,7 +3,7 @@
 ##
 ## Get latest from `dotnet new gitignore`
 
-!/bin/azcopy-commander.js
+!/[Bb]in/azcopy-commander.js
 
 # dotenv files
 .env
@@ -32,7 +32,6 @@ x86/
 [Aa][Rr][Mm]/
 [Aa][Rr][Mm]64/
 bld/
-[Bb]in/
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
