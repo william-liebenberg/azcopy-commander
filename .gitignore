@@ -3,6 +3,8 @@
 ##
 ## Get latest from `dotnet new gitignore`
 
+!/bin/azcopy-commander.js
+
 # dotenv files
 .env
 
@@ -488,3 +490,4 @@ $RECYCLE.BIN/
 
 runs/
 *.log
+
