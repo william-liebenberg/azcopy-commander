@@ -1,0 +1,21 @@
+{
+  "name": "azcopy-commander",
+  "version": "1.0.0",
+  "description": "Node.js controller for AzCopy: large-volume, append-only (delta) S3 to Azure Blob migration with live progress, timestamped logs and retryable failure lists.",
+  "type": "module",
+  "bin": {
+    "azcopy-commander": "bin/azcopy-commander.js"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "start": "node bin/azcopy-commander.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.8.1"
+  },
+  "license": "MIT",
+  "private": true
+}
