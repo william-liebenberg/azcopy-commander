@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { UsageError } from './errors.js';
+import { renameSync } from './files.js';
 
 /*
  * Chunking: the listing, in its own order, is cut into chunk files as it goes. A chunk file is a list of inventory
@@ -151,7 +152,7 @@ export class ChunkWriter {
     if (!c) return;
     this.#flush();
     fs.closeSync(c.fd);
-    fs.renameSync(`${c.file}.partial`, c.file);
+    renameSync(`${c.file}.partial`, c.file);
     this.current = null;
     await this.onClosed({ id: c.id, list: listOf(this.dir, c.file), files: c.files, bytes: c.bytes }, this.lastKey);
   }

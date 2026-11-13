@@ -3,6 +3,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { UsageError } from './errors.js';
 import { formatBytes, formatCount } from './format.js';
+import { writeFileAtomic } from './files.js';
 
 /*
  * The inventory of the source: every object, one JSON line each, in the order S3 lists them (UTF-8 binary order of the
@@ -185,9 +186,7 @@ export async function analyseInventory(files, summaryFile) {
   if (skipped.files > 0) summary.skipped = skipped;
   if (archived.files > 0) summary.archived = archived;
   fs.mkdirSync(path.dirname(summaryFile), { recursive: true });
-  const tmp = `${summaryFile}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(summary, null, 2)}\n`);
-  fs.renameSync(tmp, summaryFile);
+  writeFileAtomic(summaryFile, `${JSON.stringify(summary, null, 2)}\n`);
   return summary;
 }
 

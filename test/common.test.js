@@ -8,6 +8,7 @@ import { buildSourceUrl, parseBucketInput, buildTargetBase, parseTargetSasUrl, R
 import { deltaDateFor, listCommand, UsageError } from '../src/commands.js';
 import { parseCount, parseSize } from '../src/chunks.js';
 import { fakeS3 } from './fakes.js';
+import { renameSync, writeFileAtomic } from '../src/files.js';
 
 const SAS = 'https://acct.blob.core.windows.net/cont?sv=2022-11-02&sp=racwl&se=2099-01-01T00:00:00Z&sig=SECRETSIG123';
 
@@ -111,4 +112,38 @@ test('list prints s3://bucket/key<TAB>size from the S3 listing, needs no SAS and
   const failed = sink();
   assert.equal(await listCommand(base, sink(), failed), 2);
   assert.match(failed.text(), /S3 listing failed: AccessDenied: Access Denied/);
+});
+
+test('writeFileAtomic tries a rename again while the file is held open for a moment (EPERM on Windows)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-files-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'migration.json');
+  fs.writeFileSync(file, 'old\n');
+  const real = fs.renameSync;
+  let calls = 0;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    calls++;
+    if (calls <= 2) throw Object.assign(new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`), { code: 'EPERM' });
+    return real(from, to);
+  });
+  writeFileAtomic(file, 'new\n');
+  assert.equal(calls, 3);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'new\n');
+  assert.equal(fs.existsSync(`${file}.tmp`), false);
+
+  // A hold that lasts throws the error once the time is up; another error is thrown at once.
+  calls = 0;
+  t.mock.method(fs, 'renameSync', () => {
+    calls++;
+    throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+  });
+  assert.throws(() => renameSync(`${file}.tmp`, file, { totalMs: 50 }), { code: 'EPERM' });
+  assert.ok(calls > 1);
+  calls = 0;
+  t.mock.method(fs, 'renameSync', () => {
+    calls++;
+    throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+  });
+  assert.throws(() => renameSync(`${file}.tmp`, file), { code: 'ENOENT' });
+  assert.equal(calls, 1);
 });

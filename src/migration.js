@@ -11,6 +11,7 @@ import { analyseInventory, analysisLines, InventoryAborted, InventoryError, s3Pr
 import { ChunkWriter, chunkId, parseCount, parseSize, readChunkRecords, writeCarriedChunks } from './chunks.js';
 import { containerFor, copyChunk, createCopier, DEFAULT_BLOCK_SIZE, targetDirectory } from './blob-copy.js';
 import { withS3 } from './s3.js';
+import { writeFileAtomic } from './files.js';
 import { ChunkView, deltaLines, formatAggregate, isFinished, MigrationProgress, PlainMigrationView } from './migration-view.js';
 
 /*
@@ -54,10 +55,7 @@ export function readMigration(dir) {
 
 /** Write + rename, so a crash never leaves a half-written migration.json. */
 export function writeMigration(dir, migration) {
-  const file = migrationFile(dir);
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(migration, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  writeFileAtomic(migrationFile(dir), `${JSON.stringify(migration, null, 2)}\n`);
 }
 
 const phaseOf = (m) => (m.inventory.status !== 'done' ? 'inventory' : m.chunking && m.chunking.status !== 'done' ? 'chunking' : m.chunks.every(isFinished) ? 'done' : 'copying');
