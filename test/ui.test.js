@@ -688,7 +688,7 @@ test('Dashboard: failures and azcopy output are recorded, shown on the next redr
 });
 // ------------------------------------------------------------- chunked migrations in the wizard
 
-const migrateAnswers = (over = {}) => [pick('azcopy'), over.chunkFiles ?? '2000', over.chunkBytes ?? '500GiB', over.parallel ?? '4', true]; // inventory, objects, size, jobs, confirm
+const migrateAnswers = (over = {}) => [pick('azcopy'), over.chunkFiles ?? '2000', over.chunkBytes ?? '500GiB', over.parallel ?? '4', pick(over.ends ?? 'stop'), true]; // inventory, objects, size, jobs, when it ends, confirm
 
 test('wizard: large migration asks for the chunk limits and runs migrate with typed secrets, nothing leaked', async () => {
   const env = {};
@@ -720,7 +720,7 @@ test('wizard: large migration asks for the chunk limits and runs migrate with ty
 
 test('wizard: the chunk prompts validate their answers; the S3 inventory can be chosen', async () => {
   const calls = [];
-  const prompts = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, pick('s3'), '10', '2TiB', '3', false, pick('quit')]);
+  const prompts = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, pick('s3'), '10', '2TiB', '3', pick('stop'), false, pick('quit')]);
   assert.equal(await runWizard({ prompts, env: {}, commands: spyCommands(calls) }), 0);
   assert.deepEqual(calls, [], 'declining runs nothing');
   const byMessage = (m) => prompts.asked.find((a) => a.message.includes(m));
@@ -740,7 +740,8 @@ function fabricatedMigrations(list) {
     fs.mkdirSync(path.join(dir, x.name));
     if (x.manifest === false) continue;
     fs.writeFileSync(path.join(dir, x.name, 'migration.json'), JSON.stringify({
-      kind: 'migration', startedAt: x.startedAt, outcome: x.outcome, bucket: x.bucket ?? 'bkt', prefix: x.prefix ?? '',
+      kind: 'migration', startedAt: x.startedAt, outcome: x.outcome, bucket: x.bucket ?? 'bkt', prefix: x.prefix ?? '', region: x.region ?? '',
+      overwriteModified: Boolean(x.overwriteModified), includeAfter: x.includeAfter ?? null,
       sourceBase: 'https://s3.amazonaws.com/bkt', targetBase: x.targetBase ?? 'https://acct.blob.core.windows.net/cont',
       inventory: { status: x.inventory ?? 'done' }, chunking: { status: x.chunking ?? 'done' },
       chunks: (x.chunks ?? []).map((status, i) => ({ id: i + 1, status, bytes: 1 })),
@@ -763,8 +764,8 @@ test('wizard: continue a migration lists the unfinished ones, newest first, and 
   const prompts = fakePrompts([pick('continue'), ...typedCredentials, (o) => ((options = o.options), o.options[1].value), true]);
   assert.equal(await runWizard({ prompts, env: {}, baseOpts: { outputDir: dir }, commands: spyCommands(calls) }), 0);
   assert.equal(options.length, 2, 'the finished migration and the folder without migration.json are not offered');
-  assert.match(options[0].label, /^2026-11-06 03:00 {2}chunking {2}0\/0 chunks · stopped/);
-  assert.match(options[1].label, /^2026-11-05 02:00 {2}copying {3}2\/4 chunks · interrupted +bkt\/data/);
+  assert.match(options[0].label, /^2026-11-06 03:00 {2}full {3}chunking {2}0\/0 chunks · stopped/);
+  assert.match(options[1].label, /^2026-11-05 02:00 {2}full {3}copying {3}2\/4 chunks · interrupted +bkt\/data/);
   assert.equal(calls[0].name, 'migrate');
   assert.equal(calls[0].opts.migration, path.join(dir, '20261105T020000Z-migration'));
   assert.equal(calls[0].opts.targetSasUrl, SAS);
@@ -805,9 +806,13 @@ test('wizard: a migration on a terminal gets the migration dashboard as its view
   const run = async (out, answers) => runWizard({ prompts: fakePrompts(answers), env: {}, out, baseOpts: {}, commands: spyCommands(calls) });
   await run(fakeTerminal(), [pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers()]);
   await run(sink(), [pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers()]);
-  assert.ok(calls[0].opts.view instanceof MigrationDashboard);
-  assert.ok(calls[0].opts.view.title.startsWith('Migrating') && calls[0].opts.view.title.includes('bkt') && calls[0].opts.view.title.includes('cont'));
-  assert.equal(calls[1].opts.view, undefined);
+  assert.equal(calls[0].opts.view, undefined, 'a view per round instead of one');
+  const view = calls[0].opts.makeView({ delta: false, round: 0 });
+  assert.ok(view instanceof MigrationDashboard);
+  assert.ok(view.title.startsWith('Migrating') && view.title.includes('bkt') && view.title.includes('cont') && !view.title.includes('round'));
+  const deltaView = calls[0].opts.makeView({ delta: true, round: 2 });
+  assert.match(deltaView.title, /^Delta migration {2}bkt \S+ cont · round 2$/);
+  assert.equal(calls[1].opts.makeView, undefined);
 });
 
 // ------------------------------------------------------------- the migration dashboard
@@ -925,4 +930,171 @@ test('MigrationDashboard: a whole migrate run on a terminal is drawn in place an
       else process.env[k] = v;
     }
   }
+});
+
+// ---- options given on the command line
+
+const cliSelect = (value) => (o) => o.options.find((x) => x.value === value)?.value ?? assert.fail(`no option ${value}`);
+
+test('command line options: migrate takes them over without asking again', async () => {
+  const env = { AWS_ACCESS_KEY_ID: KEY, AWS_SECRET_ACCESS_KEY: SECRET };
+  const calls = [];
+  const presets = { sourceBucket: 'bkt', sourceRegion: 'ap-southeast-2', chunkFiles: '2000', chunkBytes: '500GiB', parallel: '4', maxAttempts: '3', inventorySource: 's3', targetSasUrl: SAS };
+  const prompts = fakePrompts([pick('migrate'), cliSelect('use'), pick('env'), false, pick('stop'), true]);
+  assert.equal(await runWizard({ prompts, env, presets, commands: spyCommands(calls) }), 0);
+  assert.equal(prompts.remaining(), 0);
+  assert.deepEqual(prompts.asked.map((a) => a.kind), ['select', 'select', 'select', 'confirm', 'select', 'confirm']);
+  const { opts } = calls[0];
+  assert.deepEqual(
+    [opts.sourceBucket, opts.sourcePrefix, opts.sourceRegion, opts.targetSasUrl, opts.overwriteModified, opts.inventorySource, opts.chunkFiles, opts.chunkBytes, opts.parallel, opts.maxAttempts],
+    ['bkt', '', 'ap-southeast-2', SAS, false, 's3', '2000', '500GiB', '4', '3'],
+  );
+  const shownText = prompts.shown.join('\n');
+  assert.match(shownText, /From the command line:[^]*Bucket +bkt[^]*Prefix +\(whole bucket\)[^]*Parallel jobs +4/);
+  assert.match(shownText, /SAS: command line/);
+  assert.ok(!shownText.includes('SECRETSIG123'));
+});
+
+test('command line options: "go through the questions" prefills them; options not given are asked', async () => {
+  const calls = [];
+  const presets = { sourceBucket: 'bkt', parallel: '4', overwriteModified: true };
+  const prompts = fakePrompts([pick('migrate'), cliSelect('review'), ...typedCredentials, (o) => o.initialValue, '', '', true, pick('azcopy'), '2000', '1TiB', (o) => o.initialValue, pick('stop'), true]);
+  assert.equal(await runWizard({ prompts, env: {}, presets, commands: spyCommands(calls) }), 0);
+  assert.equal(prompts.remaining(), 0);
+  const initial = (m) => prompts.asked.find((a) => a.message.includes(m)).initialValue;
+  assert.equal(initial('bucket name or ARN'), 'bkt');
+  assert.equal(initial('azcopy jobs at once'), '4');
+  assert.equal(initial('Replace blobs'), true);
+  assert.equal(calls[0].opts.parallel, '4');
+  assert.equal(calls[0].opts.chunkFiles, '2000');
+});
+
+test('command line options: an unusable one is reported and asked for as usual', async () => {
+  const calls = [];
+  const prompts = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, '', 'ap-southeast-2', false, pick('azcopy'), '2000', '1TiB', '4', pick('stop'), true]);
+  await runWizard({ prompts, env: {}, presets: { sourceBucket: 'bkt', sourceRegion: 'nowhere', parallel: '0' }, commands: spyCommands(calls) });
+  assert.match(prompts.shown.join('\n'), /warn: --source-region from the command line is not usable[^]*warn: --parallel from the command line is not usable/);
+  assert.ok(prompts.asked.some((a) => a.message.includes('AWS region')), 'the region is asked for');
+  assert.ok(prompts.asked.some((a) => a.message.includes('azcopy jobs at once')), 'the job count is asked for');
+  assert.equal(calls[0].opts.parallel, '4');
+});
+
+test('command line options: delta copy with a date skips the run list; full copy ignores the date', async () => {
+  const dir = fabricatedRuns(RUNS);
+  const presets = { sourceBucket: 'bkt', sourcePrefix: 'data', lastCopyDate: '2026-01-31', overwriteModified: true };
+  const calls = [];
+  const delta = fakePrompts([pick('delta'), cliSelect('use'), ...[KEY, SECRET, '', SAS], true]);
+  assert.equal(await runWizard({ prompts: delta, env: {}, presets, baseOpts: { outputDir: dir }, commands: spyCommands(calls) }), 0);
+  assert.equal(delta.remaining(), 0);
+  assert.deepEqual([calls[0].opts.sourceBucket, calls[0].opts.sourcePrefix, calls[0].opts.sourceRegion, calls[0].opts.lastCopyDate, calls[0].opts.overwriteModified], ['bkt', 'data', undefined, '2026-01-31T00:00:00.000Z', true]);
+
+  const full = fakePrompts([pick('copy'), cliSelect('use'), ...[KEY, SECRET, '', SAS], true]);
+  await runWizard({ prompts: full, env: {}, presets, commands: spyCommands(calls) });
+  assert.equal(calls[1].name, 'copy');
+  assert.equal(calls[1].opts.lastCopyDate, undefined);
+  assert.ok(!full.shown.join('\n').includes('Modified since'));
+});
+
+test('command line options: continue applies --parallel and --max-attempts', async () => {
+  const calls = [];
+  const dir = fabricatedMigrations([MIGRATIONS[1]]);
+  const prompts = fakePrompts([pick('continue'), KEY, SECRET, '', SAS, pickRun(0), true]);
+  await runWizard({ prompts, env: {}, presets: { parallel: '2', maxAttempts: '9' }, baseOpts: { outputDir: dir }, commands: spyCommands(calls) });
+  assert.equal(prompts.remaining(), 0);
+  assert.deepEqual([calls[0].opts.parallel, calls[0].opts.maxAttempts], ['2', '9']);
+  assert.match(prompts.shown.join('\n'), /Changes +--parallel 2 --max-attempts 9/);
+});
+
+
+// ---- delta migrations
+
+const FINISHED = { name: '20261108T050000Z-migration', startedAt: '2026-11-08T05:00:00.000Z', outcome: 'partial', prefix: 'data', region: 'ap-southeast-2', overwriteModified: true, chunks: ['success', 'exhausted'] };
+const sameAsInitial = (o) => o.initialValue;
+
+test('wizard: delta migration lists the finished migrations, passes its date and folder, and prefills the source', async () => {
+  const dir = fabricatedMigrations([MIGRATIONS[0], MIGRATIONS[1], FINISHED]);
+  const calls = [];
+  let options;
+  const prompts = fakePrompts([pick('delta-migrate'), ...typedCredentials, (o) => ((options = o.options), o.options[0].value), sameAsInitial, sameAsInitial, sameAsInitial, sameAsInitial, ...migrateAnswers()]);
+  assert.equal(await runWizard({ prompts, env: {}, baseOpts: { outputDir: dir }, commands: spyCommands(calls), columns: 400 }), 0);
+  assert.equal(prompts.remaining(), 0);
+  assert.equal(prompts.asked.find((a) => a.kind === 'select' && a.message.startsWith('Delta since which migration')).message, 'Delta since which migration? (times are UTC, newest first)');
+  assert.deepEqual(options.map((o) => o.label), [
+    '2026-11-08 05:00  full   done      2/2 chunks · partial     bkt/data',
+    '2026-11-01 01:00  full   done      2/2 chunks · success     bkt',
+    'Enter a date instead',
+  ], 'the interrupted migration is not a baseline');
+  const { opts } = calls[0];
+  assert.equal(calls[0].name, 'migrate');
+  assert.equal(opts.lastCopyDate, '2026-11-08T04:50:00.000Z');
+  assert.equal(opts.baselineDir, path.join(dir, FINISHED.name));
+  assert.deepEqual([opts.sourceBucket, opts.sourcePrefix, opts.sourceRegion, opts.overwriteModified, opts.repeat], ['bkt', 'data', 'ap-southeast-2', true, undefined]);
+  const summary = prompts.shown.find((s) => s.startsWith('note Summary'));
+  assert.match(summary, /Mode +delta, objects modified on\/after 2026-11-08T04:50:00\.000Z \(start of .*20261108T050000Z-migration, minus 10 min\)/);
+  assert.match(summary, /Carried +nothing/);
+});
+
+test('wizard: delta migration with no finished migration goes straight to the date', async () => {
+  const dir = fabricatedMigrations([MIGRATIONS[1]]);
+  const calls = [];
+  const prompts = fakePrompts([pick('delta-migrate'), ...typedCredentials, '2026-01-31', ...sourceAnswers, ...migrateAnswers()]);
+  assert.equal(await runWizard({ prompts, env: {}, baseOpts: { outputDir: dir }, commands: spyCommands(calls) }), 0);
+  assert.equal(prompts.remaining(), 0);
+  assert.ok(prompts.asked.some((a) => a.message.startsWith('List objects modified on/after')));
+  assert.deepEqual([calls[0].opts.lastCopyDate, calls[0].opts.baselineDir], ['2026-01-31T00:00:00.000Z', undefined]);
+  assert.match(prompts.shown.find((s) => s.startsWith('note Summary')), /Mode +delta, objects modified on\/after 2026-01-31T00:00:00\.000Z\n/);
+});
+
+test('wizard: delta migration from a migration to another target asks for confirmation', async () => {
+  const dir = fabricatedMigrations([{ ...FINISHED, targetBase: 'https://other.blob.core.windows.net/elsewhere' }]);
+  const calls = [];
+  const declined = fakePrompts([pick('delta-migrate'), ...typedCredentials, pickRun(0), false, pick('quit')]);
+  assert.equal(await runWizard({ prompts: declined, env: {}, baseOpts: { outputDir: dir }, commands: spyCommands(calls) }), 0);
+  assert.deepEqual(calls, []);
+  assert.ok(declined.shown.some((s) => s.startsWith('warn: That migration copied to')));
+  const accepted = fakePrompts([pick('delta-migrate'), ...typedCredentials, pickRun(0), true, ...sourceAnswers, ...migrateAnswers()]);
+  assert.equal(await runWizard({ prompts: accepted, env: {}, baseOpts: { outputDir: dir }, commands: spyCommands(calls) }), 0);
+  assert.equal(calls.length, 1);
+});
+
+test('command line options: --last-copy-date auto answers the baseline question of a delta migration', async () => {
+  const dir = fabricatedMigrations([FINISHED]);
+  const calls = [];
+  const prompts = fakePrompts([pick('delta-migrate'), cliSelect('use'), ...typedCredentials, false, ...migrateAnswers()]);
+  assert.equal(await runWizard({ prompts, env: {}, presets: { sourceBucket: 'bkt', lastCopyDate: 'auto' }, baseOpts: { outputDir: dir }, commands: spyCommands(calls) }), 0);
+  assert.equal(prompts.remaining(), 0);
+  assert.ok(!prompts.asked.some((a) => a.message.startsWith('Delta since which migration')));
+  assert.deepEqual([calls[0].opts.lastCopyDate, calls[0].opts.baselineDir], ['auto', undefined]);
+  assert.match(prompts.shown.find((s) => s.startsWith('note Summary')), /Mode +delta, objects modified since the previous run \(auto\)/);
+
+  // a full migration ignores the date
+  const full = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, false, ...migrateAnswers()]);
+  await runWizard({ prompts: full, env: {}, presets: { sourceBucket: 'bkt', lastCopyDate: 'auto' }, baseOpts: { outputDir: dir }, commands: spyCommands(calls) });
+  assert.equal(calls[1].opts.lastCopyDate, undefined);
+});
+
+test('wizard: "Keep running deltas" passes --repeat and its limit; command line options answer the question', async () => {
+  const calls = [];
+  const prompts = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, pick('azcopy'), '2000', '1TiB', '4', pick('repeat'), (o) => (assert.equal(o.initialValue, '10000'), '5000'), true]);
+  assert.equal(await runWizard({ prompts, env: {}, commands: spyCommands(calls) }), 0);
+  assert.equal(prompts.remaining(), 0);
+  assert.deepEqual([calls[0].opts.repeat, calls[0].opts.repeatUntil, calls[0].opts.repeatMax], [true, '5000', undefined]);
+  assert.match(prompts.shown.find((s) => s.startsWith('note Summary')), /Repeat +until ≤ 5,000 objects, at most 10 deltas/);
+  assert.match(prompts.asked.find((a) => a.message.startsWith('Stop when a delta')).validate('x'), /whole number/);
+
+  const presets = { sourceBucket: 'bkt', repeat: true, repeatUntil: '200', repeatMax: '3' };
+  const fromCli = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, false, pick('azcopy'), '2000', '1TiB', '4', true]);
+  assert.equal(await runWizard({ prompts: fromCli, env: {}, presets, commands: spyCommands(calls) }), 0);
+  assert.equal(fromCli.remaining(), 0);
+  assert.deepEqual([calls[1].opts.repeat, calls[1].opts.repeatUntil, calls[1].opts.repeatMax], [true, '200', '3']);
+  assert.match(fromCli.shown.join('\n'), /When it ends +run deltas until one finds few objects[^]*Repeat until +≤ 200 objects[^]*Repeat +until ≤ 200 objects, at most 3 deltas/);
+});
+
+test('wizard: the continue list shows whether a migration is full or delta', async () => {
+  const dir = fabricatedMigrations([MIGRATIONS[1], { name: '20261110T010000Z-delta-migration', startedAt: '2026-11-10T01:00:00.000Z', outcome: 'interrupted', includeAfter: '2026-11-08T04:50:00Z', chunks: ['pending', 'pending'] }]);
+  let options;
+  const prompts = fakePrompts([pick('continue'), ...typedCredentials, (o) => ((options = o.options), o.options[0].value), true]);
+  assert.equal(await runWizard({ prompts, env: {}, baseOpts: { outputDir: dir }, commands: spyCommands([]) }), 0);
+  assert.match(options[0].label, /^2026-11-10 01:00 {2}delta {2}copying {3}0\/2 chunks · interrupted/);
+  assert.match(options[1].label, /^2026-11-05 02:00 {2}full {3}copying /);
 });

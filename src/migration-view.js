@@ -104,12 +104,29 @@ export function chunkEndLine(c) {
 const TITLES = { success: 'Migration completed', partial: 'Migration completed with failed files', failed: 'Migration failed', interrupted: 'Migration interrupted', stopped: 'Migration stopped' };
 export const migrationTitle = (outcome) => TITLES[outcome] ?? outcome;
 
+/**
+ * What makes a migration a delta, as [label, text] pairs (none for a full migration): the date and where it came
+ * from, and the files carried over from the baseline. `m` has `includeAfter`, `baseline` and `carried` (migration.json).
+ */
+export function deltaLines(m) {
+  if (!m.includeAfter) return [];
+  const from = m.baseline ? ` (start of ${m.baseline.dir}, minus 10 min)` : ' (date given)';
+  const lines = [['Delta', `objects modified on/after ${m.includeAfter}${from}`]];
+  const c = m.carried;
+  if (c) {
+    const where = c.chunks === undefined ? 'in the first chunk(s)' : `in ${formatCount(c.chunks)} chunk(s)${c.inInventory ? `, ${formatCount(c.inInventory)} of them modified since and copied with the inventory` : ''}`;
+    lines.push(['Carried', `${formatCount(c.files)} file(s) that ${m.baseline.dir} did not copy (${formatCount(c.fromChunks.length)} chunk(s)), ${formatBytes(c.bytes)}, ${where}`]);
+  }
+  return lines;
+}
+
 /** The final summary of a migration (console and migration log). `result` is built by migrateCommand. */
 export function migrationSummaryLines(result, hints = {}) {
   const lines = [
     '',
     '============== Migration summary ==============',
     `Status:           ${migrationTitle(result.outcome)}`,
+    ...deltaLines(result).map(([label, text]) => `${`${label}:`.padEnd(18)}${text}`),
     `Chunks:           ${formatCount(result.chunksSuccess)} copied, ${formatCount(result.chunksExhausted)} with failed files after ${formatCount(result.maxAttempts)} attempt(s), ${formatCount(result.chunksOpen)} not finished (of ${formatCount(result.chunksTotal)})`,
     `Files copied:     ${formatCount(result.copied)}`,
     `Files failed:     ${formatCount(result.failed)}`,
@@ -129,20 +146,21 @@ export function migrationSummaryLines(result, hints = {}) {
  * methods). All of them are optional to call from a test; the orchestrator always calls `start` first and
  * `close` last.
  *
- *   start({ dir, logFile })
- *   inventoryStarted({ provider, source })     inventoryProgress({ files, bytes })
+ *   start({ dir, logFile, migration })         `migration` is the migration.json record
+ *   inventoryStarted({ provider, source, includeAfter })   inventoryProgress({ files, bytes })
  *   analysis(summary, lines)                   chunking({ chunks, skipped, maxFiles, maxBytes, chunksDir })
  *   copyStarted({ chunks, total, parallel })   chunkStarted(id)   chunkEnded(chunkEntry)
  *   progress(aggregateSnapshot, { periodic })  failure(id, path, code)
  *   message(level, text)   log(level, text)    summary(result, hints)   close()
  */
 export class PlainMigrationView extends PlainView {
-  start({ dir }) {
+  start({ dir, migration }) {
     this.print(`Migration: ${dir}`);
+    for (const [label, text] of migration ? deltaLines(migration) : []) this.print(`${`${label}:`.padEnd(11)}${text}`);
   }
 
-  inventoryStarted({ provider, source }) {
-    this.print(`Inventory (${provider}) of ${source} ...`);
+  inventoryStarted({ provider, source, includeAfter }) {
+    this.print(`Inventory (${provider}) of ${source}${includeAfter ? `, modified on/after ${includeAfter}` : ''} ...`);
   }
 
   inventoryProgress({ files, bytes }) {
@@ -154,7 +172,9 @@ export class PlainMigrationView extends PlainView {
   }
 
   chunking({ chunks, skipped, maxFiles, maxBytes, chunksDir }) {
-    this.print(`Chunks: ${formatCount(chunks.length)} (≤ ${formatCount(maxFiles)} objects or ≤ ${formatBytes(maxBytes)} each) in ${chunksDir}`);
+    const carried = chunks.filter((c) => c.carried).length;
+    const split = carried > 0 ? ` (${formatCount(carried)} carried over + ${formatCount(chunks.length - carried)} from the inventory)` : '';
+    this.print(`Chunks: ${formatCount(chunks.length)}${split} (≤ ${formatCount(maxFiles)} objects or ≤ ${formatBytes(maxBytes)} each) in ${chunksDir}`);
     if (skipped > 0) this.print(`  ${formatCount(skipped)} key(s) with a line break cannot be copied; they are listed in skipped.jsonl`);
   }
 

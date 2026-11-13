@@ -5,9 +5,10 @@ import { runWizard } from './wizard.js';
 
 /**
  * Starts the interactive wizard. @clack/prompts is only loaded here, so the other commands
- * keep working without `npm install`. `baseOpts` carries the shared CLI options (--output-dir, ...).
+ * keep working without `npm install`. `baseOpts` carries the shared CLI options (--output-dir, ...), `presets` the
+ * others given on the command line (--source-bucket, --parallel, ...).
  */
-export async function runUi(baseOpts = {}) {
+export async function runUi(baseOpts = {}, presets = {}) {
   let prompts;
   try {
     prompts = await import('@clack/prompts');
@@ -18,5 +19,5 @@ export async function runUi(baseOpts = {}) {
   }
   // One write per redraw instead of several: removes the flicker on keypresses (see output.js).
   prompts = withCoalescedOutput(prompts, process.stdout);
-  return runWizard({ prompts, env: process.env, out: process.stdout, err: process.stderr, baseOpts });
+  return runWizard({ prompts, env: process.env, out: process.stdout, err: process.stderr, baseOpts, presets });
 }

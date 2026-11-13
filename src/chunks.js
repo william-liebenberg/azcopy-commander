@@ -36,16 +36,26 @@ const unlistable = (p) => /[\r\n]/.test(p);
  * Splits the inventory into `<chunksDir>/00001.txt`, `00002.txt`, ... A chunk is closed when it holds
  * `maxFiles` objects, or when the next object would take it past `maxBytes`; an object of `maxBytes` or
  * more gets a chunk of its own. Keys that cannot be listed go to `<chunksDir>/skipped.jsonl` (only
- * written when there are some). Returns { chunks: [{ id, list, files, bytes }], skipped }; `list` is
- * relative to the migration folder (`dir`, default: the folder above `chunksDir`).
+ * written when there are some). Returns { chunks: [{ id, list, files, bytes, carried? }], skipped, carriedInInventory };
+ * `list` is relative to the migration folder (`dir`, default: the folder above `chunksDir`).
+ *
+ * `carried` (a delta migration): a Map of path -> size, the files an earlier migration did not copy. A carried path
+ * that is also in the inventory is left to its inventory chunk (two jobs never write the same blob; the Map loses
+ * it). The others become the first chunks, split by `maxFiles` and marked `carried: true`; the inventory chunks
+ * follow them. `carriedInInventory` counts the carried paths found in the inventory.
  */
-export async function createChunks({ inventoryFile, chunksDir, maxFiles, maxBytes, dir = path.dirname(chunksDir) }) {
+export async function createChunks({ inventoryFile, chunksDir, maxFiles, maxBytes, dir = path.dirname(chunksDir), carried = null }) {
   fs.rmSync(chunksDir, { recursive: true, force: true });
   fs.mkdirSync(chunksDir, { recursive: true });
-  const chunks = [];
+  const inventoryChunks = [];
   let skipped = 0;
+  let carriedInInventory = 0;
   let skippedStream = null;
   let current = null; // { id, file, stream, files, bytes }
+  // The inventory chunks are numbered after the carried ones, whose count is only known at the end: they get a
+  // temporary name first.
+  const inventoryName = (id) => path.join(chunksDir, `${chunkId(id)}.inventory`);
+  const listOf = (file) => path.relative(dir, file).split(path.sep).join('/');
 
   const write = async (stream, text) => {
     if (!stream.write(text)) await once(stream, 'drain');
@@ -54,7 +64,7 @@ export async function createChunks({ inventoryFile, chunksDir, maxFiles, maxByte
     if (!current) return;
     current.stream.end();
     await once(current.stream, 'close');
-    chunks.push({ id: current.id, list: path.relative(dir, current.file).split(path.sep).join('/'), files: current.files, bytes: current.bytes });
+    inventoryChunks.push({ file: current.file, files: current.files, bytes: current.bytes });
     current = null;
   };
 
@@ -67,11 +77,11 @@ export async function createChunks({ inventoryFile, chunksDir, maxFiles, maxByte
         await write(skippedStream, `${JSON.stringify({ path: record.path, size, reason: 'line break in the key' })}\n`);
         return;
       }
+      if (carried?.delete(record.path)) carriedInInventory++;
       if (current && (current.files + 1 > maxFiles || current.bytes + size > maxBytes)) await close();
       if (!current) {
-        const id = chunks.length + 1;
-        const file = path.join(chunksDir, `${chunkId(id)}.txt`);
-        current = { id, file, stream: fs.createWriteStream(file), files: 0, bytes: 0 };
+        const file = inventoryName(inventoryChunks.length + 1);
+        current = { file, stream: fs.createWriteStream(file), files: 0, bytes: 0 };
       }
       await write(current.stream, `${record.path}\n`);
       current.files++;
@@ -85,5 +95,20 @@ export async function createChunks({ inventoryFile, chunksDir, maxFiles, maxByte
       await once(skippedStream, 'close');
     }
   }
-  return { chunks, skipped };
+
+  const chunks = [];
+  const carriedPaths = [...(carried?.keys() ?? [])];
+  for (let i = 0; i < carriedPaths.length; i += maxFiles) {
+    const paths = carriedPaths.slice(i, i + maxFiles);
+    const file = path.join(chunksDir, `${chunkId(chunks.length + 1)}.txt`);
+    fs.writeFileSync(file, `${paths.join('\n')}\n`);
+    chunks.push({ id: chunks.length + 1, list: listOf(file), files: paths.length, bytes: paths.reduce((s, p) => s + (Number(carried.get(p)) || 0), 0), carried: true });
+  }
+  for (const c of inventoryChunks) {
+    const id = chunks.length + 1;
+    const file = path.join(chunksDir, `${chunkId(id)}.txt`);
+    fs.renameSync(c.file, file);
+    chunks.push({ id, list: listOf(file), files: c.files, bytes: c.bytes });
+  }
+  return { chunks, skipped, carriedInInventory };
 }

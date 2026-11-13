@@ -174,8 +174,9 @@ export function renderMigrationDashboard(state, { columns = 80, rows, color = fa
  * one job: it shares its timer, resize handling, coalesced writes and cursor handling.
  */
 export class MigrationDashboard extends Dashboard {
-  constructor(options = {}) {
-    super({ title: 'Migrating', ...options });
+  constructor({ delta = false, round, ...options } = {}) {
+    super({ title: delta ? 'Delta migration' : 'Migrating', ...options });
+    if (round > 0) this.title += ` · round ${round}`; // with --repeat
     this.phase = 'inventory';
     this.provider = null;
     this.inventory = { files: 0, bytes: 0 };

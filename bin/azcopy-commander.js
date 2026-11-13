@@ -21,7 +21,8 @@ Usage:
 The ui command asks for the bucket (name or ARN), the AWS keys and the SAS URL (hidden input, or taken from the
 environment), lets you pick an earlier run for delta / retry / resume, then runs the same commands. Secrets stay in
 memory only. Needs "npm install" (it uses @clack/prompts); the other commands do not. Options: --output-dir,
---plan-dir, --azcopy-path, --azcopy-arg, --dry-run.
+--plan-dir, --azcopy-path, --azcopy-arg, --dry-run. Any other option given with it (--source-bucket, --source-region,
+--parallel, --chunk-files, ...) is shown and offered to the wizard, which then does not ask for it again.
 
 Credentials are read from the environment only:
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY [, AWS_SESSION_TOKEN]   S3 read access
@@ -44,6 +45,8 @@ copy options:
 migrate: saves an inventory of the source, analyses it, splits it into chunk files and copies the chunks with several
 azcopy jobs at once. Everything is recorded in <output-dir>/<timestamp>-migration, so it can be stopped (Ctrl+C) and continued.
 Takes the copy options above (--source-bucket, --source-prefix, --source-region, --last-copy-date, --overwrite-modified).
+With --last-copy-date it is a delta migration (<timestamp>-delta-migration): only objects modified on/after the date are
+listed; with "auto" after a migration, the files that migration did not copy are carried into the delta's first chunks.
   --inventory-source <s>      How the source is listed: azcopy (default, azcopy --dry-run) or s3 (ListObjectsV2 with the
                               AWS SDK; needs "npm install"; also finds archived objects)
   --chunk-files <n>           Most objects per chunk (default 1000000)
@@ -54,6 +57,10 @@ Takes the copy options above (--source-bucket, --source-prefix, --source-region,
   --migration <dir>           Continue this migration. Without it, and without --source-bucket, the latest one in
                               <output-dir> is shown and you are asked to confirm it (--yes skips the question).
                               --parallel and --max-attempts can be changed when continuing.
+  --repeat                    After this migration, run delta migrations one after another (each based on the one
+                              before it) until one finds few enough objects to stop the writers and cut over
+  --repeat-until <n>          Stop repeating when a delta's inventory has at most n objects (default 10000)
+  --repeat-max <n>            At most n delta migrations (default 10)
 
 all commands:
   --output-dir <dir>          Where run directories and state.json go (default ./runs)
@@ -90,6 +97,9 @@ const options = {
   parallel: { type: 'string' },
   'max-attempts': { type: 'string' },
   'stop-after': { type: 'string' },
+  repeat: { type: 'boolean' },
+  'repeat-until': { type: 'string' },
+  'repeat-max': { type: 'string' },
   migration: { type: 'string' },
   yes: { type: 'boolean', short: 'y' },
   help: { type: 'boolean', short: 'h' },
@@ -117,9 +127,12 @@ async function main() {
       process.stderr.write('The ui command needs an interactive terminal (stdin and stdout must be a TTY).\n');
       return EXIT.USAGE;
     }
-    const baseOpts = Object.fromEntries(['output-dir', 'plan-dir', 'azcopy-path', 'azcopy-arg', 'dry-run'].filter((k) => k in parsed.values).map((k) => [camelCase(k), parsed.values[k]]));
+    const baseKeys = ['output-dir', 'plan-dir', 'azcopy-path', 'azcopy-arg', 'dry-run'];
+    const baseOpts = Object.fromEntries(baseKeys.filter((k) => k in parsed.values).map((k) => [camelCase(k), parsed.values[k]]));
+    // Everything else given on the command line is offered to the wizard instead of being asked for again.
+    const presets = Object.fromEntries(Object.entries(parsed.values).filter(([k]) => !baseKeys.includes(k) && !['help', 'yes', 'run', 'migration'].includes(k)).map(([k, v]) => [camelCase(k), v]));
     try {
-      return await runUi(baseOpts);
+      return await runUi(baseOpts, presets);
     } catch (err) {
       process.stderr.write(`Unexpected error: ${err.stack ?? err}\n`);
       return EXIT.FAILED;

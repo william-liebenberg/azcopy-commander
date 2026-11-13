@@ -55,14 +55,18 @@ node bin/azcopy-commander.js ui      # or just: node bin/azcopy-commander.js  (i
 
 A step-by-step wizard instead of a long command line. It asks for:
 
-1. **The action**: full copy, delta copy, list, retry failed files, resume a run, **large migration (chunked)**, **continue a migration**, or quit.
+1. **The action**: full copy, delta copy, list, retry failed files, resume a run, **large migration (chunked)**, **delta migration (chunked)**, **continue a migration**, or quit.
 2. **AWS credentials**: taken from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` when they are set (you choose *Use them* or *Enter other credentials*), otherwise typed with hidden input (plus an optional session token).
 3. **The target SAS URL**: from `AZCOPY_COMMANDER_TARGET_SAS_URL` or typed hidden. It is validated as you type (container URL, signature, write permission, expiry); warnings such as "expires soon" are shown, the signature never is.
 4. **An earlier run** (delta, retry, resume): a list of the runs in the output directory (`--output-dir`, default `./runs`), newest first, with start time (UTC), kind, outcome, copied / failed counts and bucket. Delta lists runs that finished (success or partial) and copies objects modified since that run started minus 10 minutes (as `--last-copy-date auto` does); *Enter a date instead* covers any other date, and is the only choice when no run exists yet. Retry lists runs with failed files; resume lists unfinished runs that have an azcopy job. When there is none, the wizard says so and returns to the menu.
 5. **The source** (full, delta, list): bucket name **or ARN**, optional prefix and region, and whether to replace blobs when the S3 object is newer. A delta copy prefills these from the chosen run.
 6. A **summary** and a confirmation, then the copy, retry or resume runs with a live dashboard (below).
 
-A *large migration* asks for the source as the full copy does, then how the source is listed (azcopy dry run or the S3 API), the most objects and the most data in a chunk and the number of azcopy jobs at once (defaults prefilled: 1,000,000 objects, 1TiB, 10), shows a summary and runs `migrate`. *Continue a migration* lists the unfinished migrations in the output directory, newest first, with their phase and chunks done, asks for the credentials again and continues the one you pick (a SAS for another target is refused).
+A *large migration* asks for the source as the full copy does, then how the source is listed (azcopy dry run or the S3 API), the most objects and the most data in a chunk and the number of azcopy jobs at once (defaults prefilled: 1,000,000 objects, 1TiB, 10), asks what happens when it ends (*Stop*, or *Keep running deltas until one finds at most N objects*, which is `--repeat` with `--repeat-until N`), shows a summary and runs `migrate`. A *delta migration* first asks for the baseline: a migration that ended `success` or `partial` (it fills in the source and `--overwrite-modified`, carries its failed files over and copies the objects modified since it started minus 10 minutes), or *Enter a date instead*, the only choice when no migration has finished yet; a target that differs from the baseline's asks for confirmation. The rest is the large migration's questions, and its summary shows the mode, the carried files and the repeat limits (see [Keeping up with a growing bucket](#keeping-up-with-a-growing-bucket)). *Continue a migration* lists the unfinished migrations in the output directory, newest first, with their mode (`full` or `delta`), phase and chunks done, asks for the credentials again and continues the one you pick (a SAS for another target is refused).
+
+**Options given on the command line** are picked up by the wizard (`azcopy-commander --source-bucket my-bucket --source-region ap-southeast-2 --parallel 4 --chunk-files 500000`, with or without `ui`). Right after you choose the action it lists the ones that apply and asks, as it does for secrets found in the environment, whether to *Use them* (the questions they answer are skipped) or to *Go through the questions with them filled in*. Details: `--source-bucket` makes the source complete, so an absent `--source-prefix` / `--source-region` means the whole bucket / the global endpoint (shown in the list; choose the second option to change them); `--last-copy-date` answers the delta question and the delta migration's baseline question (including `auto`) and is applied to *List*; `--repeat`, `--repeat-until` and `--repeat-max` answer the *When it ends?* question of both migrations; `--max-attempts` and `--stop-after` have no question and always apply to a migration; `--parallel` and `--max-attempts` apply when continuing one; `--target-sas-url` is used as is (it is visible in the process list of the machine, so the environment variable is the safer way). An option that cannot be used is reported and asked for as usual. Retry and resume work on the run you pick and ignore them.
+
+**Options given on the command line** are picked up by the wizard (`azcopy-commander --source-bucket my-bucket --source-region ap-southeast-2 --parallel 4 --chunk-files 500000`, with or without `ui`). Right after you choose the action it lists the ones that apply and asks, as it does for secrets found in the environment, whether to *Use them* (the questions they answer are skipped) or to *Go through the questions with them filled in*. Details: `--source-bucket` makes the source complete, so an absent `--source-prefix` / `--source-region` means the whole bucket / the global endpoint (shown in the list; choose the second option to change them); `--last-copy-date` answers the delta question (including `auto`) and is applied to *List*; `--max-attempts` and `--stop-after` have no question and always apply to a migration; `--parallel` and `--max-attempts` apply when continuing one; `--target-sas-url` is used as is (it is visible in the process list of the machine, so the environment variable is the safer way). An option that cannot be used is reported and asked for as usual. Retry and resume work on the run you pick and ignore them.
 
 A copy started from the wizard shows a live dashboard in the style of the prompts instead of the one-line progress and the plain summary:
 
@@ -144,6 +148,7 @@ node bin/azcopy-commander.js migrate --source-bucket my-bucket --source-region a
 node bin/azcopy-commander.js migrate --source-bucket my-bucket --stop-after inventory   # look at the analysis first
 node bin/azcopy-commander.js migrate --migration runs/20261112T020000Z-migration       # continue (or: without --migration, the latest, after confirmation)
 node bin/azcopy-commander.js migrate --source-bucket my-bucket --last-copy-date auto    # delta: only what changed since the last migration or copy
+node bin/azcopy-commander.js migrate --source-bucket my-bucket --repeat                 # a full migration, then deltas until caught up
 ```
 
 | Option | Meaning |
@@ -155,14 +160,17 @@ node bin/azcopy-commander.js migrate --source-bucket my-bucket --last-copy-date 
 | `--max-attempts <n>` | Attempts per chunk, retries of failed files included (default 5) |
 | `--stop-after inventory\|chunk` | Stop after a phase, to review the analysis or the chunks; continue with `--migration` |
 | `--migration <dir>` | Continue this migration. The options it started with (source, chunk limits, inventory source) are kept; `--parallel` and `--max-attempts` can be changed. The SAS is asked for again (it is never written down) and must target the same container. |
+| `--repeat` | After this migration, run delta migrations one after another (see [Keeping up with a growing bucket](#keeping-up-with-a-growing-bucket)). Not with `--stop-after`. |
+| `--repeat-until <n>` | Stop repeating when a delta's inventory has at most n objects (default 10000) |
+| `--repeat-max <n>` | At most n delta migrations (default 10) |
 
 Also accepted: `--source-prefix`, `--source-region`, `--last-copy-date`, `--overwrite-modified`, `--output-dir`, `--plan-dir` (split per chunk: jobs that run at once cannot share a plan folder), `--azcopy-path`, `--azcopy-arg`, `--dry-run` (prints the phases and the azcopy commands of the inventory and of the first chunk; creates nothing), `-y/--yes`.
 
-### The migration folder (`runs/<timestamp>-migration/`)
+### The migration folder (`runs/<timestamp>-migration/`, `runs/<timestamp>-delta-migration/`)
 
 | File | Content |
 |---|---|
-| `migration.json` | The options, the state of each phase and one entry per chunk (status, attempts, files, bytes, counters, run folders). Written atomically. |
+| `migration.json` | The options, the state of each phase and one entry per chunk (status, attempts, files, bytes, counters, run folders). A delta also records `includeAfter`, its `baseline` (the run or migration the date came from) and the `carried` files. Written atomically. |
 | `inventory.jsonl` | One object per line, `{"path":"data/a b.txt","size":10}` (`lastModified` and `storageClass` with `s3`). Written as `.partial` and renamed when complete. JSON lines because S3 keys may contain tabs. |
 | `inventory-summary.json` | The analysis |
 | `chunks/00001.txt` ... | Lists of paths relative to the source root, for `azcopy copy --list-of-files` |
@@ -182,7 +190,32 @@ Ctrl+C stops starting chunks, interrupts the running azcopy jobs (their plans st
 
 `AZCOPY_CONCURRENCY_VALUE` and `AZCOPY_BUFFER_GB` are read by **every** azcopy job, so with `--parallel 10` they apply ten times: size them per job (for example `AZCOPY_BUFFER_GB` = what you can spare for azcopy, divided by the number of jobs) and watch memory and open connections on the machine, especially with the default of 10 jobs. The overall percentage and ETA are known from the first chunk on, because the inventory gives the total size up front. The inventory of 10^7 - 10^8 objects is a few GB on disk, and each chunk's plan files grow with the chunk: use `--plan-dir` for a large disk.
 
-Limits: objects written after the inventory are in no chunk (run a delta afterwards); keys with a line break cannot be copied; archived objects must be restored first; chunks run on this machine only.
+Limits: objects written after the inventory are in no chunk (run a delta afterwards, below); keys with a line break cannot be copied; archived objects must be restored first; chunks run on this machine only.
+
+### Keeping up with a growing bucket
+
+A full migration of a large bucket takes days, and objects keep arriving the whole time. A **delta migration** is an ordinary chunked migration (inventory, chunks, worker pool, its own folder that can be stopped and continued) whose inventory keeps only the objects modified on/after a date: `--include-after` for the azcopy dry run, `LastModified` for `--inventory-source s3`. The usual workflow:
+
+1. **Full migration**: `migrate --source-bucket my-bucket ...`. When it ends `success` or `partial`, its start is saved in `state.json`.
+2. **Deltas**: `migrate --source-bucket my-bucket --last-copy-date auto` copies the objects modified since the previous migration started, minus 10 minutes (the same overlap as `copy`), **plus the files that migration did not copy**. Repeat while the source keeps changing; each delta is shorter than the one before.
+3. **Cutover**: when a delta finds few objects, stop the writers, run one last delta, and switch to the target.
+
+`--repeat` does step 2 for you: after the migration it is given (a new one, or `--migration <dir>`), it runs deltas back to back, each one based on the migration that just ended, until a delta's inventory has at most `--repeat-until` objects (default 10,000), or `--repeat-max` deltas (default 10) have run, in which case it says that the source is still changing faster than the deltas catch up. The count that stops it is the inventory of the delta, not the carried files: it measures how fast the source changes. A round that fails or is interrupted (Ctrl+C, exit 130; `migrate --migration <that delta> --repeat` continues) ends the loop; the exit code is that of the last round. Each round has its own folder, log and summary, and a repeat summary lists the rounds and prints the cutover command. `--dry-run` with `--repeat` shows the first migration and the two limits.
+
+```text
+Migration: runs\20261115T090000Z-delta-migration
+Delta:     objects modified on/after 2026-11-12T01:50:00Z (start of runs\20261112T020000Z-migration, minus 10 min)
+Carried:   1,204 file(s) that runs\20261112T020000Z-migration did not copy (2 chunk(s)), 3.10 GiB, in chunk 00001
+```
+
+* **Carried-over files.** When the baseline is a migration, the delta starts with what that migration did not copy: for each `exhausted` chunk, the failed files of its last run, or its whole list when the job itself failed (files already copied are skipped: append-only). They are the delta's first chunks, marked `carried` in `migration.json`, split by `--chunk-files` like the others. A path that is both carried and modified is only in the inventory chunk, so two jobs never write the same blob. The baseline migration is not changed; a file that fails again is carried into the next delta. A typed `--last-copy-date` (or a baseline that is a `copy` run) carries nothing. The carried paths are held in memory while the inventory is chunked: about 100 MB per million paths, at most `--chunk-files` per failed chunk.
+* **What a delta costs.** S3 cannot filter by date on the server, so every delta **lists the whole bucket** and filters as it goes: a delta takes at least as long as a full inventory (tens of minutes for ten million objects). That sets the shortest gap between deltas, which is why `--repeat-until` defaults to 10,000 rather than 0 and the last step is to stop the writers.
+* **Nothing to copy.** A delta with no modified objects and nothing carried ends at once as `success` with 0 chunks (`Nothing was modified on/after ...`), and still moves the baseline forward.
+* **The baseline only moves forward.** A migration that ends after a newer one was recorded (an older migration continued late) keeps the newer `state.json` entry (`state.json kept: a later run is recorded` in its log), so `auto` never goes back in time.
+* **Modified objects.** Without `--overwrite-modified`, an object rewritten after it was copied is listed but skipped (append-only); with it, the newer version replaces the blob.
+
+> [!WARNING]
+> An object uploaded in parts gets the time its upload **started** as its last-modified time. If such an upload starts more than 10 minutes before a migration and completes after the inventory has passed its key, the object is in neither that migration's inventory nor the next delta. For buckets with long multipart uploads, pass an earlier explicit `--last-copy-date` to the last delta before cutover.
 
 ## Progress
 
@@ -227,7 +260,7 @@ Exit codes: `0` ok, `1` completed with failed files, `2` job failed, `64` usage 
 
 ## What was and was not verified
 
-* `migrate` is verified against the fake azcopy (inventory, analysis, chunk boundaries, the worker pool and its limit, retries, interruption and continuation, `--stop-after`, `--dry-run`, no secrets on disk or screen) and against a fake S3 client; the wizard flows and the migration dashboard with scripted prompts and a fake terminal. **Not verified, needed before a production-size run** (no S3 bucket or storage account was available): (a) `--list-of-files` with an S3 source copies exactly the listed keys to the right blob names, including keys with spaces and non-ASCII characters; if it does not, chunks would have to fall back to `--include-path` lists of prefixes, a different chunking; (b) ten azcopy jobs at once with separate plan folders: memory and connections on the machine, and whether azcopy looks up each listed path in S3 on its own (more requests, slower start per chunk); (c) the time and memory of the azcopy dry-run inventory of a large prefix, to decide whether `--inventory-source s3` should be the default; (d) `jobs resume` of an interrupted chunk against a real azcopy plan, and the real AWS SDK listing.
+* `migrate` is verified against the fake azcopy (inventory, analysis, chunk boundaries, the worker pool and its limit, retries, interruption and continuation, `--stop-after`, `--dry-run`, delta migrations with carried-over files, `--repeat`, the forward-only baseline, no secrets on disk or screen) and against a fake S3 client; the wizard flows and the migration dashboard with scripted prompts and a fake terminal. **Not verified, needed before a production-size run** (no S3 bucket or storage account was available): (a) `--list-of-files` with an S3 source copies exactly the listed keys to the right blob names, including keys with spaces and non-ASCII characters; if it does not, chunks would have to fall back to `--include-path` lists of prefixes, a different chunking; (b) ten azcopy jobs at once with separate plan folders: memory and connections on the machine, and whether azcopy looks up each listed path in S3 on its own (more requests, slower start per chunk); (c) the time and memory of the azcopy dry-run inventory of a large prefix, to decide whether `--inventory-source s3` should be the default; (d) `jobs resume` of an interrupted chunk against a real azcopy plan, and the real AWS SDK listing.
 
 * Verified with the real azcopy 10.32.8: all flags used are accepted; `--as-subdir=false` keeps the source layout (checked with a local
   source in `--dry-run`); JSON `Init`/`Error` messages parse; `--dry-run --output-type json --log-level NONE` emits `Dryrun` messages (`Source`, `SourceSize`, `EntityType`) and writes nothing under `~/.azcopy` (checked with a local source); a copy with invalid AWS credentials is reported as a failed run.

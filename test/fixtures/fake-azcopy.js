@@ -5,6 +5,8 @@
 //   FAKE_CHATTER          emit Info / stderr lines that carry secrets (they must be redacted)
 //   FAKE_NO_TRANSFERS     answer a copy with "no transfers were scheduled"
 //   FAKE_DRYRUN_COUNT     a --dry-run lists N files, d<i%3>/obj-<i>.bin of size 10*i, instead of the two fixed ones
+//   FAKE_DRYRUN_COUNTS    "25,5,0": the same, one entry per dry run in turn (the last one repeats; 0 lists nothing);
+//                         the dry runs are counted in <FAKE_ARGS_FILE>.dryruns
 //   FAKE_DELAY_MS         a copy job takes this long (to see jobs running at once)
 //   FAKE_EVENTS_FILE      append "start <ms>" / "end <ms>" lines for every copy job (to measure concurrency)
 //   FAKE_FAIL_LIST        --list-of-files jobs fail these paths: "a.txt,b.txt:2" (":N" = only the first N times;
@@ -71,14 +73,24 @@ function failingPaths(listed) {
   return failing;
 }
 
+/** The file count of this dry run: FAKE_DRYRUN_COUNTS in turn, else FAKE_DRYRUN_COUNT (NaN: the fixed files). */
+function dryRunCount() {
+  const counts = (process.env.FAKE_DRYRUN_COUNTS ?? '').split(',').filter(Boolean).map(Number);
+  if (counts.length === 0) return Number(process.env.FAKE_DRYRUN_COUNT) || NaN;
+  const file = `${process.env.FAKE_ARGS_FILE}.dryruns`;
+  const done = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').length : 0;
+  fs.appendFileSync(file, '.');
+  return counts[Math.min(done, counts.length - 1)];
+}
+
 if (args[0] === '--version') {
   console.log('azcopy version 10.99.0-fake');
 } else {
   if (process.env.FAKE_ARGS_FILE) fs.appendFileSync(process.env.FAKE_ARGS_FILE, `${JSON.stringify(args)}\n`);
   if (args.includes('--dry-run')) {
     const item = (name, size, type = 'File') => emit('Dryrun', { EntityType: type, FromTo: 'S3Blob', Source: `${S3}/${name.split('/').map(encodeURIComponent).join('/')}`, Destination: 'dst', SourceSize: size });
-    const count = Number(process.env.FAKE_DRYRUN_COUNT);
-    if (count > 0) {
+    const count = dryRunCount();
+    if (count >= 0) {
       for (let i = 1; i <= count; i++) item(`d${i % 3}/obj-${String(i).padStart(5, '0')}.bin`, i * 10);
     } else {
       item('a b.txt', 10);

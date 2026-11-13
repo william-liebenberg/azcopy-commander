@@ -13,7 +13,7 @@ import { readState } from '../src/state.js';
 
 const SAS = 'https://acct.blob.core.windows.net/cont?sv=2022-11-02&sp=racwl&se=2099-01-01T00:00:00Z&sig=SECRETSIG123';
 const AWS_SECRET = 'awssecretawssecretawssecret';
-const FAKE_VARS = ['FAKE_DRYRUN_COUNT', 'FAKE_DELAY_MS', 'FAKE_FAIL_LIST', 'FAKE_NO_TRANSFERS', 'FAKE_CHATTER'];
+const FAKE_VARS = ['FAKE_DRYRUN_COUNT', 'FAKE_DRYRUN_COUNTS', 'FAKE_DELAY_MS', 'FAKE_FAIL_LIST', 'FAKE_NO_TRANSFERS', 'FAKE_CHATTER'];
 
 const sink = () => {
   const chunks = [];
@@ -45,6 +45,9 @@ function setup(fake = {}) {
 const listCalls = (calls) => calls.filter((a) => a[0] === 'copy' && a.includes('--list-of-files'));
 const dryRunCalls = (calls) => calls.filter((a) => a.includes('--dry-run'));
 const readLines = (file) => fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+/** The migration folders of an output directory, oldest first (by their start, not their name). */
+const migrationDirs = (dir) => fs.readdirSync(dir).filter((f) => /-migration$/.test(f)).map((f) => path.join(dir, f)).sort((a, b) => readMigration(a).startedAt.localeCompare(readMigration(b).startedAt));
+const deltaDate = (m) => new Date(Date.parse(m.startedAt) - 10 * 60_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
 /** The most jobs that ran at once, from the start / end events of the fake. */
 function maxConcurrent(events) {
@@ -547,4 +550,216 @@ test('a chunk run is an ordinary run: retry --run and resume --run work on it', 
   const out = sink();
   assert.equal(await retryCommand({ ...base, run }, out), 0, out.text());
   assert.match(out.text(), /Retrying 1 failed file\(s\)/);
+});
+
+
+// ------------------------------------------------------------- delta migrations
+
+test('chunking with carried paths: they come first, split by --chunk-files; one also in the inventory stays there', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-carried-'));
+  const file = writeRawInventory(dir, [{ path: 'a', size: 1 }, { path: 'c2', size: 5 }, { path: 'b', size: 1 }]);
+  const carried = new Map([['c1', 10], ['c2', 20], ['c3', 30], ['c4', 40]]);
+  const { chunks, carriedInInventory } = await createChunks({ inventoryFile: file, chunksDir: path.join(dir, 'chunks'), maxFiles: 2, maxBytes: 1000, carried });
+  assert.equal(carriedInInventory, 1);
+  assert.deepEqual(chunks.map((c) => [c.id, c.list, c.files, c.bytes, Boolean(c.carried)]), [
+    [1, 'chunks/00001.txt', 2, 40, true], [2, 'chunks/00002.txt', 1, 40, true], [3, 'chunks/00003.txt', 2, 6, false], [4, 'chunks/00004.txt', 1, 1, false],
+  ]);
+  assert.deepEqual(readLines(path.join(dir, 'chunks/00001.txt')), ['c1', 'c3']);
+  assert.deepEqual(readLines(path.join(dir, 'chunks/00003.txt')), ['a', 'c2']);
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'chunks')).sort(), ['00001.txt', '00002.txt', '00003.txt', '00004.txt'], 'no temporary file left');
+});
+
+test('delta migration: --last-copy-date auto after a full migration; date, folder, baseline, lists and state.json', async () => {
+  const { dir, base, calls } = setup({ FAKE_DRYRUN_COUNT: '4' });
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2 }, sink()), 0);
+  const [full] = migrationDirs(dir);
+  const fullM = readMigration(full);
+
+  // the dry run shows the date and the baseline and creates nothing
+  const names = fs.readdirSync(dir);
+  const dry = sink();
+  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto', dryRun: true }, dry), 0);
+  assert.deepEqual(fs.readdirSync(dir), names);
+  assert.match(dry.text(), new RegExp(`Mode: +delta \\(objects modified on/after ${deltaDate(fullM)}\\)`));
+  assert.match(dry.text(), /Delta: +objects modified on\/after .* \(start of .*-migration, minus 10 min\)/);
+  assert.match(dry.text(), /Folder: +.*-delta-migration/);
+
+  const before = calls().length;
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, lastCopyDate: 'auto' }, out), 0, out.text());
+  const delta = migrationDirs(dir)[1];
+  assert.match(path.basename(delta), /^\d{8}T\d{6}Z-delta-migration$/);
+  const m = readMigration(delta);
+  assert.equal(m.includeAfter, deltaDate(fullM));
+  assert.deepEqual(m.baseline, { startedAt: fullM.startedAt, dir: full });
+  assert.equal(m.carried, null, 'the full migration copied everything');
+  const after = calls().slice(before);
+  const inventory = dryRunCalls(after);
+  assert.equal(inventory.length, 1);
+  assert.equal(inventory[0][inventory[0].indexOf('--include-after') + 1], m.includeAfter);
+  assert.ok(listCalls(after).length === 2 && listCalls(after).every((a) => !a.includes('--include-after')), 'the chunk lists name the files');
+  assert.deepEqual(Object.values(readState(path.join(dir, 'state.json'))).map((s) => [s.startedAt, s.runDir]), [[m.startedAt, delta]]);
+  assert.match(out.text(), /Delta: +objects modified on\/after .* \(start of .*-migration, minus 10 min\)/);
+  assert.match(out.text(), /Inventory \(azcopy dry-run\) of .*, modified on\/after /);
+  assert.match(out.text(), /Status: +Migration completed\nDelta: +objects modified/);
+
+  const listed = listMigrations({ outputDir: dir });
+  assert.deepEqual(listed.map((x) => [x.mode, x.includeAfter]), [['delta', m.includeAfter], ['full', null]]);
+});
+
+test('delta migration: the failed files of a partial baseline are carried into the first chunk; a typed date carries nothing', async () => {
+  // The full migration: chunks [obj-00001, obj-00002] and [obj-00003, obj-00004]; obj-00002 and obj-00004 fail.
+  const { dir, base } = setup({ FAKE_DRYRUN_COUNTS: '4,2', FAKE_FAIL_LIST: 'd1/obj-00004.bin,d2/obj-00002.bin' });
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, maxAttempts: 1 }, sink()), 1);
+  const [full] = migrationDirs(dir);
+  delete process.env.FAKE_FAIL_LIST;
+
+  // The delta lists obj-00001 and obj-00002 (modified since): obj-00002 is copied with the inventory, obj-00004 is carried.
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, lastCopyDate: 'auto' }, out), 0, out.text());
+  const delta = migrationDirs(dir)[1];
+  const m = readMigration(delta);
+  assert.deepEqual(m.carried, { files: 2, bytes: 20, fromChunks: [1, 2], chunks: 1, inInventory: 1 });
+  assert.deepEqual(m.chunks.map((c) => [c.id, c.files, Boolean(c.carried), c.status]), [[1, 1, true, 'success'], [2, 2, false, 'success']]);
+  assert.deepEqual(readLines(path.join(delta, 'chunks/00001.txt')), ['d1/obj-00004.bin']);
+  assert.deepEqual(readLines(path.join(delta, 'chunks/00002.txt')), ['d1/obj-00001.bin', 'd2/obj-00002.bin']);
+  assert.match(out.text(), /Carried: +2 file\(s\) that .*-migration did not copy \(2 chunk\(s\)\), 20 B, in the first chunk\(s\)/);
+  assert.match(out.text(), /Chunks: 2 \(1 carried over \+ 1 from the inventory\)/);
+  assert.match(out.text(), /Carried: +2 file\(s\) .* in 1 chunk\(s\), 1 of them modified since/);
+  const baseline = readMigration(full);
+  assert.deepEqual([baseline.outcome, ...baseline.chunks.map((c) => c.status)], ['partial', 'exhausted', 'exhausted'], 'the baseline is left as it was');
+
+  // a typed date has no baseline
+  process.env.FAKE_DRYRUN_COUNTS = '2';
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, lastCopyDate: '2026-01-01' }, sink()), 0);
+  const typed = readMigration(migrationDirs(dir)[2]);
+  assert.deepEqual([typed.includeAfter, typed.baseline, typed.carried, typed.chunks.length], ['2026-01-01T00:00:00Z', null, null, 1]);
+});
+
+test('delta migration: a baseline chunk whose job failed is carried as its whole list; an inventory with nothing modified is fine', async () => {
+  const { dir, base } = setup({ FAKE_DRYRUN_COUNTS: '4,0' });
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, stopAfter: 'chunk' }, sink()), 0);
+  const [full] = migrationDirs(dir);
+  // as if the job of chunk 1 failed on every attempt
+  const fullM = readMigration(full);
+  Object.assign(fullM.chunks[0], { status: 'exhausted', lastOutcome: 'failed', attempts: 5 });
+  Object.assign(fullM.chunks[1], { status: 'success' });
+  fullM.outcome = 'partial';
+  fs.writeFileSync(path.join(full, 'migration.json'), JSON.stringify(fullM));
+
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 5, baselineDir: full }, out), 0, out.text());
+  const m = readMigration(migrationDirs(dir)[1]);
+  assert.equal(m.includeAfter, deltaDate(fullM));
+  assert.deepEqual(m.carried, { files: 2, bytes: 30, fromChunks: [1], chunks: 1, inInventory: 0 });
+  assert.equal(m.inventory.files, 0);
+  assert.deepEqual(m.chunks.map((c) => [c.files, c.bytes, c.carried, c.status]), [[2, 30, true, 'success']]);
+  assert.deepEqual(readLines(path.join(migrationDirs(dir)[1], 'chunks/00001.txt')), ['d1/obj-00001.bin', 'd2/obj-00002.bin']);
+});
+
+test('delta migration: nothing modified and nothing carried ends at once as success, and the baseline moves forward', async () => {
+  const { dir, base, calls } = setup({ FAKE_DRYRUN_COUNTS: '4,0' });
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2 }, sink()), 0);
+  const copies = listCalls(calls()).length;
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto' }, out), 0, out.text());
+  const delta = migrationDirs(dir)[1];
+  const m = readMigration(delta);
+  assert.deepEqual([m.outcome, m.chunking.status, m.chunks.length], ['success', 'done', 0]);
+  assert.equal(listCalls(calls()).length, copies, 'no copy job');
+  assert.match(out.text(), /Nothing was modified on\/after .* and nothing is carried over: no chunk to copy\./);
+  assert.match(out.text(), /Status: +Migration completed\n[^]*Chunks: +0 copied/);
+  assert.ok(!out.text().includes('Copying'));
+  assert.equal(Object.values(readState(path.join(dir, 'state.json')))[0].runDir, delta);
+});
+
+test('state.json only moves forward: an older migration continued after a newer delta keeps the delta as the baseline', async () => {
+  const { dir, base } = setup({ FAKE_DRYRUN_COUNTS: '4,1', FAKE_FAIL_LIST: 'd1/obj-00004.bin' });
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, maxAttempts: 1 }, sink()), 1);
+  const [full] = migrationDirs(dir);
+  process.env.FAKE_FAIL_LIST = 'd1/obj-00004.bin'; // the carried file still fails in the delta
+  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto', maxAttempts: 1 }, sink()), 1);
+  const delta = migrationDirs(dir)[1];
+  delete process.env.FAKE_FAIL_LIST;
+  assert.equal(await migrateCommand({ ...base, migration: full }, sink()), 0);
+  assert.equal(readMigration(full).outcome, 'success');
+  assert.equal(Object.values(readState(path.join(dir, 'state.json')))[0].runDir, delta);
+  const log = fs.readdirSync(full).filter((f) => f.endsWith('.log')).map((f) => fs.readFileSync(path.join(full, f), 'utf8')).join('');
+  assert.match(log, /state\.json kept: a later run is recorded/);
+});
+
+test('delta migration with --inventory-source s3 and auto: the listing keeps the keys modified since the baseline', async () => {
+  const { dir, base } = setup();
+  const s3 = (extra = {}) => migrateCommand({ ...base, inventorySource: 's3', s3ListPage: fakeS3(S3_KEYS).listPage, chunkFiles: 10, ...extra }, sink());
+  assert.equal(await s3(), 0);
+  const file = path.join(dir, 'state.json');
+  const [[key, entry]] = Object.entries(readState(file));
+  fs.writeFileSync(file, JSON.stringify({ [key]: { ...entry, startedAt: '2026-02-01T00:10:00.000Z' } }));
+  assert.equal(await s3({ lastCopyDate: 'auto' }), 0);
+  const delta = migrationDirs(dir).find((d) => d.endsWith('-delta-migration'));
+  assert.equal(readMigration(delta).includeAfter, '2026-02-01T00:00:00Z');
+  assert.deepEqual(readLines(path.join(delta, 'inventory.jsonl')).map((l) => JSON.parse(l).path), ['sub/b c.txt', 'new.txt']);
+});
+
+// ------------------------------------------------------------- --repeat
+
+test('--repeat: deltas follow until one finds at most --repeat-until objects; each is based on the one before', async () => {
+  const { dir, base, calls } = setup({ FAKE_DRYRUN_COUNTS: '25,12,5' });
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 10, repeat: true, repeatUntil: '5' }, out), 0, out.text());
+  const dirs = migrationDirs(dir);
+  assert.equal(dirs.length, 3);
+  const [full, d1, d2] = dirs.map(readMigration);
+  assert.equal(full.includeAfter, null);
+  assert.deepEqual([d1.baseline.dir, d1.includeAfter, d1.inventory.files], [dirs[0], deltaDate(full), 12]);
+  assert.deepEqual([d2.baseline.dir, d2.includeAfter, d2.inventory.files], [dirs[1], deltaDate(d1), 5]);
+  assert.deepEqual([d1.options.chunkFiles, d2.prefix, d2.region], [10, 'data', 'ap-southeast-2'], 'the settings of the round before');
+  assert.deepEqual(dryRunCalls(calls()).map((a) => a.includes('--include-after')), [false, true, true]);
+  const text = out.text();
+  assert.match(text, /Round 0: the migration, then deltas until one finds ≤ 5 objects/);
+  assert.match(text, /Round 2: delta 2 of at most 10/);
+  assert.match(text, /Repeat summary[^]*\nfull +\S+-migration +25 +25 +success\n1 +\S+-delta-migration +12 +12 +success\n2 +\S+-delta-migration +5 +5 +success\n/);
+  assert.match(text, /Caught up: the last delta found 5 objects \(≤ 5\)\. Stop the writers and run one more delta for cutover:\n {2}azcopy-commander migrate --source-bucket bkt --source-prefix data --source-region ap-southeast-2 --last-copy-date auto/);
+});
+
+test('--repeat: stops at --repeat-max; the failed files of a partial round are carried into the next one', async () => {
+  // obj-00004 fails once (the full migration ends partial); every delta lists obj-00001 and obj-00002
+  const { dir, base } = setup({ FAKE_DRYRUN_COUNTS: '4,2', FAKE_FAIL_LIST: 'd1/obj-00004.bin:1' });
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, maxAttempts: 1, repeat: true, repeatUntil: 1, repeatMax: '2' }, out), 0, out.text());
+  const dirs = migrationDirs(dir);
+  assert.equal(dirs.length, 3, 'the migration and two deltas');
+  const d1 = readMigration(dirs[1]);
+  assert.deepEqual(d1.chunks.map((c) => [Boolean(c.carried), c.status]), [[true, 'success'], [false, 'success']]);
+  assert.deepEqual(readLines(path.join(dirs[1], 'chunks/00001.txt')), ['d1/obj-00004.bin']);
+  assert.equal(readMigration(dirs[2]).carried, null);
+  assert.match(out.text(), /full +\S+ +4 +3 +partial\n1 +\S+ +2 +3 +success\n2 +\S+ +2 +2 +success/);
+  assert.match(out.text(), /Not caught up after 2 delta\(s\): the last one found 2 objects \(more than 1\)\.\nThe source is still changing faster/);
+});
+
+test('--repeat: an interrupted round stops the loop with 130 and says how to continue', async () => {
+  const { dir, base, events } = setup({ FAKE_DRYRUN_COUNTS: '2', FAKE_DELAY_MS: '1500' });
+  const abort = new AbortController();
+  const out = sink();
+  const running = migrateCommand({ ...base, repeat: true, abortSignal: abort.signal }, out);
+  while (events().filter(([n]) => n === 'start').length < 2) await sleep(20); // the copy job of the first delta has started
+  abort.abort();
+  assert.equal(await running, 130, out.text());
+  const dirs = migrationDirs(dir);
+  assert.equal(dirs.length, 2);
+  assert.equal(readMigration(dirs[1]).outcome, 'interrupted');
+  assert.match(out.text(), /\n1 +\S+-delta-migration +2 +0 +interrupted\n/);
+  assert.match(out.text(), /Interrupted in round 1\. Continue it, and the deltas after it, with:\n {2}azcopy-commander migrate --migration ".*-delta-migration" --repeat\n/);
+});
+
+test('--repeat: usage errors, and a dry run says that deltas would follow', async () => {
+  const { dir, base } = setup();
+  await assert.rejects(migrateCommand({ ...base, repeat: true, stopAfter: 'chunk' }, sink()), /--repeat cannot be used with --stop-after/);
+  await assert.rejects(migrateCommand({ ...base, repeatUntil: '5' }, sink()), /--repeat-until needs --repeat/);
+  await assert.rejects(migrateCommand({ ...base, repeat: true, repeatUntil: '-1' }, sink()), /--repeat-until/);
+  await assert.rejects(migrateCommand({ ...base, repeat: true, repeatMax: '0' }, sink()), /--repeat-max/);
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, repeat: true, repeatUntil: '0', dryRun: true }, out), 0);
+  assert.deepEqual(fs.readdirSync(dir), []);
+  assert.match(out.text(), /Then: +delta migrations one after another, until one finds at most 0 objects \(at most 10 deltas\)/);
 });
