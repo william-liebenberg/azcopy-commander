@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runWizard, fit } from '../src/ui/wizard.js';
+import { migrateCommandLine, shellQuote } from '../src/ui/command-line.js';
 import { Secrets } from '../src/ui/secrets.js';
 import { colorEnabled, createStyle, unicodeSupported, visible } from '../src/ui/style.js';
 import * as realCommands from '../src/commands.js';
@@ -859,4 +860,50 @@ test('MigrationDashboard: a whole migrate run with the SDK fakes is drawn in pla
     for (const secret of SECRET_TEXTS) assert.ok(!term.writes.join('').includes(secret), `${secret} on screen`);
     assert.equal(term.listeners.resize?.length ?? 0, 0, 'resize listener removed');
   });
+});
+
+// ---- the command line shown before a migration starts
+
+test('migrateCommandLine: the options of the migration, quoted for the shell, without the SAS URL or internal options', () => {
+  const opts = {
+    targetSasUrl: SAS, makeView: () => {}, baselineDir: '/runs/old', s3: {}, yes: true,
+    sourceBucket: 'bkt', sourcePrefix: "my data/it's", sourceRegion: 'ap-southeast-2', lastCopyDate: '2026-01-31T00:00:00.000Z',
+    overwriteModified: false, chunkFiles: '2000', chunkBytes: '500GiB', parallel: '3', concurrency: '16', repeat: true, repeatUntil: '100',
+    outputDir: path.resolve('runs'), dryRun: true,
+  };
+  const out = path.resolve('runs');
+  assert.equal(
+    migrateCommandLine(opts, { platform: 'win32' }),
+    `azcopy-commander migrate --source-bucket bkt --source-prefix 'my data/it''s' --source-region ap-southeast-2 --last-copy-date 2026-01-31T00:00:00.000Z --chunk-files 2000 --chunk-bytes 500GiB --parallel 3 --concurrency 16 --repeat --repeat-until 100 --output-dir ${shellQuote(out, 'win32')} --dry-run`,
+  );
+  assert.match(migrateCommandLine(opts, { platform: 'linux' }), / --source-prefix 'my data\/it'\\''s' /);
+  assert.equal(shellQuote('C:\\Users\\me\\runs', 'win32'), 'C:\\Users\\me\\runs');
+  assert.equal(shellQuote('C:\\Users\\me\\runs', 'linux'), "'C:\\Users\\me\\runs'");
+  assert.equal(shellQuote('', 'linux'), "''");
+  assert.ok(!migrateCommandLine(opts).includes('SECRETSIG123'));
+  const continued = migrateCommandLine({ migration: path.join('runs', 'x-migration'), parallel: '2', targetSasUrl: SAS }, { platform: 'linux' });
+  assert.equal(continued, `azcopy-commander migrate --migration ${shellQuote(path.resolve('runs', 'x-migration'), 'linux')} --parallel 2 --output-dir ${shellQuote(path.resolve('runs'), 'linux')}`);
+});
+
+test('wizard: the command line of the migration is shown on a line of its own just before it starts, without secrets', async () => {
+  const out = sink();
+  let shownBefore;
+  const commands = spyCommands([]);
+  commands.migrateCommand = async () => {
+    shownBefore = out.text();
+    return 0;
+  };
+  const prompts = fakePrompts(migrateScript());
+  assert.equal(await runWizard({ prompts, env: {}, out, baseOpts: { outputDir: 'runs' }, commands }), 0);
+  const line = shownBefore.split('\n').find((l) => l.startsWith('azcopy-commander migrate '));
+  assert.ok(line, 'the command line is written before migrateCommand runs');
+  assert.equal(line, migrateCommandLine({ sourceBucket: 'bkt', sourcePrefix: 'data', sourceRegion: 'ap-southeast-2', chunkFiles: '2000', chunkBytes: '500GiB', parallel: '3', concurrency: '16', outputDir: 'runs' }));
+  assert.ok(prompts.shown.some((s) => s.startsWith('info: To run this migration again without the wizard') && s.includes('AZCOPY_COMMANDER_TARGET_SAS_URL')));
+  for (const secret of SECRET_TEXTS) assert.ok(!out.text().includes(secret) && !prompts.shown.join('\n').includes(secret));
+
+  // Continuing a migration shows its command line too.
+  const dir = fabricatedMigrations(MIGRATIONS);
+  const cont = sink();
+  await runWizard({ prompts: fakePrompts([pick('continue'), ...typedCredentials, pickRun(0), true]), env: {}, out: cont, baseOpts: { outputDir: dir }, commands: spyCommands([]) });
+  assert.match(cont.text(), /^azcopy-commander migrate --migration \S+ --output-dir \S+$/m);
 });

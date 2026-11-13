@@ -10,6 +10,7 @@ import { buildSourceUrl, buildTargetBase, parseBucketInput, parseTargetSasUrl, n
 import { UsageError } from '../errors.js';
 import { Secrets } from './secrets.js';
 import { MigrationDashboard } from './migration-dashboard.js';
+import { migrateCommandLine } from './command-line.js';
 import { fit } from './style.js';
 
 export { fit };
@@ -242,8 +243,13 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
 
   const migrationLabel = (m) => shown(`${utcMinute(m.startedAt)}  ${(m.mode ?? 'full').padEnd(5)}  ${m.phase.padEnd(9)} ${m.chunksDone}/${m.chunksTotal} chunks · ${m.outcome.padEnd(11)} ${m.bucket ?? '?'}${m.prefix ? `/${m.prefix}` : ''}`);
 
-  /** Runs migrateCommand with the migration dashboard on a terminal, one per round (the plain output otherwise). */
+  /**
+   * Runs migrateCommand with the migration dashboard on a terminal, one per round (the plain output otherwise). The
+   * command line that runs the same migration without the wizard is shown first, on a line of its own to copy it.
+   */
   async function runMigration(opts, target, bucket) {
+    prompts.log.info(`To run this migration again without the wizard (no secret in it: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY [, AWS_SESSION_TOKEN] and ${ENV_SAS} first):`);
+    out.write(`${secrets.redact(migrateCommandLine(opts))}\n\n`);
     if (out.isTTY) {
       const container = new URL(target.base).pathname.replace(/^\/+/, '');
       opts.makeView = ({ delta, round }) => new MigrationDashboard({ out, columns, route: [bucket, container], delta, round });
