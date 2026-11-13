@@ -135,6 +135,26 @@ test('the inventory is written as JSON lines, through .partial; a failed listing
   assert.deepEqual(fs.readdirSync(dir).sort(), ['inventory.jsonl']);
 });
 
+test('writing many records under backpressure adds no listeners per record (no MaxListenersExceededWarning)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-inv-'));
+  const file = path.join(dir, 'inventory.jsonl');
+  const warnings = [];
+  const onWarning = (w) => warnings.push(w);
+  process.on('warning', onWarning);
+  try {
+    // ~100 KiB per record against the stream's 16 KiB buffer: every write reports backpressure, and the
+    // provider (like azcopy's) does not wait on the promise `onObject` returns.
+    const records = Array.from({ length: 50 }, (_, i) => ({ path: `${i}/${'x'.repeat(100_000)}`, size: i }));
+    const result = await writeInventory({ file, provider: { list: async (on) => records.forEach((r) => on(r)) } });
+    await new Promise((resolve) => setImmediate(resolve)); // process warnings are emitted on a later tick
+    assert.equal(result.files, 50);
+    assert.equal(readLines(file).length, 50);
+    assert.deepEqual(warnings.map((w) => w.name), []);
+  } finally {
+    process.off('warning', onWarning);
+  }
+});
+
 test('analysis: counts, size histogram, largest objects, top-level prefixes, storage classes and a warning for archived ones', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-ana-'));
   const GiB = 2 ** 30;

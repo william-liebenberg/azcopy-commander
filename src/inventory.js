@@ -125,6 +125,22 @@ export async function writeInventory({ file, provider, onProgress, intervalMs = 
   stream.on('error', (err) => {
     streamError = err;
   });
+  // One drain wait at a time, shared by every record written meanwhile (a provider that does not await
+  // `onObject` would otherwise add a listener per record), with its listeners removed once it settles.
+  let drainWait = null;
+  const waitForDrain = () => {
+    drainWait ??= new Promise((resolve) => {
+      const done = () => {
+        stream.off('drain', done);
+        stream.off('close', done); // a failed stream never drains: it closes
+        drainWait = null;
+        resolve();
+      };
+      stream.once('drain', done);
+      stream.once('close', done);
+    });
+    return drainWait;
+  };
   let files = 0;
   let bytes = 0;
   let lastReport = 0;
@@ -139,7 +155,7 @@ export async function writeInventory({ file, provider, onProgress, intervalMs = 
         lastReport = Date.now();
         onProgress({ files, bytes });
       }
-      return ok ? undefined : once(stream, 'drain').catch(() => {});
+      return ok ? undefined : waitForDrain();
     });
     stream.end();
     await once(stream, 'close');
