@@ -7,13 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { parseCount, parseSize, createChunks } from '../src/chunks.js';
 import { analyseInventory, analysisLines, s3Provider, writeInventory, InventoryError } from '../src/inventory.js';
 import { MigrationProgress, formatAggregate, PlainMigrationView } from '../src/migration-view.js';
-import { listMigrations, migrateCommand, readMigration } from '../src/migration.js';
+import { collectCarried, listMigrations, migrateCommand, readMigration } from '../src/migration.js';
 import { copyCommand, listRuns, listCommand } from '../src/commands.js';
 import { readState } from '../src/state.js';
 
 const SAS = 'https://acct.blob.core.windows.net/cont?sv=2022-11-02&sp=racwl&se=2099-01-01T00:00:00Z&sig=SECRETSIG123';
 const AWS_SECRET = 'awssecretawssecretawssecret';
-const FAKE_VARS = ['FAKE_DRYRUN_COUNT', 'FAKE_DRYRUN_COUNTS', 'FAKE_DELAY_MS', 'FAKE_FAIL_LIST', 'FAKE_NO_TRANSFERS', 'FAKE_CHATTER'];
+const FAKE_VARS = ['FAKE_DRYRUN_COUNT', 'FAKE_DRYRUN_COUNTS', 'FAKE_DELAY_MS', 'FAKE_FAIL_LIST', 'FAKE_NO_TRANSFERS', 'FAKE_CHATTER', 'FAKE_ALL_FAILED'];
 
 const sink = () => {
   const chunks = [];
@@ -383,6 +383,26 @@ test('migrate: a chunk that keeps failing is exhausted; the outcome is partial; 
   assert.deepEqual(m.chunks.map((c) => [c.status, c.attempts]), [['success', 1], ['success', 1]]);
   assert.equal(calls().length - before, 1, 'one retry job, no inventory');
   assert.equal(m.outcome, 'success');
+});
+
+test('migrate: a retry pass where every file fails (azcopy: Failed) stays partial, and a delta carries only those files', async () => {
+  const { dir, base, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '3', FAKE_FAIL_LIST: 'd2/obj-00002.bin', FAKE_ALL_FAILED: '1' });
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, maxAttempts: 2 }, out), 1, out.text());
+  const mdir = migrationDir();
+  const m = readMigration(mdir);
+  assert.equal(m.outcome, 'partial');
+  const [c] = m.chunks;
+  assert.deepEqual([c.status, c.attempts, c.lastOutcome, c.copied, c.failed], ['exhausted', 2, 'partial', 2, 1]);
+  assert.ok(readState(path.join(dir, 'state.json')), 'the baseline is recorded');
+  assert.deepEqual([...collectCarried(mdir).paths.keys()], ['d2/obj-00002.bin'], 'only the failed file is carried');
+});
+
+test('migrate: a first pass where every file fails (azcopy: Failed) is failed', async () => {
+  const { dir, base, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '1', FAKE_FAIL_LIST: 'd1/obj-00001.bin', FAKE_ALL_FAILED: '1' });
+  assert.equal(await migrateCommand({ ...base, maxAttempts: 1 }, sink()), 2);
+  assert.equal(readMigration(migrationDir()).chunks[0].lastOutcome, 'failed');
+  assert.ok(!fs.existsSync(path.join(dir, 'state.json')));
 });
 
 test('migrate: an interrupted migration continues without listing or chunking again; the running job is resumed', async () => {

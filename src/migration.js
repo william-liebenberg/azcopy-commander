@@ -605,20 +605,26 @@ async function runOneMigration(opts, out) {
         const report = await execute({ opts: { ...opts, view: view_ }, out, redactor, manifest: { ...manifest, attempt: chunk.attempts }, args, prepare, signal: abort.signal });
         progress.clear(chunk.id);
 
-        if (report.outcome === 'success' || report.outcome === 'partial') {
+        // azcopy ends a job as `Failed` (not CompletedWithErrors) when every transfer in it failed. On a retry pass that is the
+        // files that keep failing, after an earlier attempt copied the rest: still partial, so the failed files are
+        // retried or carried, and not the whole chunk. (A `Cancelled` job stays failed: its counters cannot be trusted.)
+        let outcome = report.outcome;
+        if (action === 'retry' && outcome === 'failed' && report.jobStatus === 'Failed' && report.failed > 0 && report.files.failed) outcome = 'partial';
+
+        if (outcome === 'success' || outcome === 'partial') {
           // Only an attempt that ended adds its numbers: an interrupted or failed job is continued or repeated later.
           chunk.copied += report.copied;
           chunk.ignored += report.ignored;
           chunk.bytesCopied += report.bytesCopied;
           chunk.failed = report.failed;
         }
-        chunk.status = report.outcome;
-        log('INFO', `chunk ${chunkId(chunk.id)} attempt ${chunk.attempts}: ${report.outcome} (copied ${report.copied}, failed ${report.failed}, ignored ${report.ignored})`);
-        if (report.outcome === 'success') {
+        chunk.status = outcome;
+        log('INFO', `chunk ${chunkId(chunk.id)} attempt ${chunk.attempts}: ${outcome} (copied ${report.copied}, failed ${report.failed}, ignored ${report.ignored})`);
+        if (outcome === 'success') {
           chunk.failed = 0;
           break;
         }
-        if (report.outcome === 'interrupted') break;
+        if (outcome === 'interrupted') break;
         if (chunk.attempts >= options.maxAttempts) {
           chunk.lastOutcome = chunk.status;
           chunk.status = 'exhausted';

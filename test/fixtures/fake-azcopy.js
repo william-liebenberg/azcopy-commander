@@ -11,6 +11,7 @@
 //   FAKE_EVENTS_FILE      append "start <ms>" / "end <ms>" lines for every copy job (to measure concurrency)
 //   FAKE_FAIL_LIST        --list-of-files jobs fail these paths: "a.txt,b.txt:2" (":N" = only the first N times;
 //                         the counts are kept in <FAKE_ARGS_FILE>.fails)
+//   FAKE_ALL_FAILED       a job in which every file fails ends as `Failed`, as azcopy does, not CompletedWithErrors
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -118,7 +119,8 @@ if (args[0] === '--version') {
     event('end');
     emit('EndOfJob', {
       ...base,
-      JobStatus: bad.length > 0 ? 'CompletedWithErrors' : 'Completed',
+      // like azcopy, `Failed` when every transfer of the job failed (FAKE_ALL_FAILED)
+      JobStatus: bad.length === 0 ? 'Completed' : process.env.FAKE_ALL_FAILED && bad.length === n ? 'Failed' : 'CompletedWithErrors',
       FileTransfers: String(n),
       TotalTransfers: String(n),
       TransfersCompleted: String(n - bad.length),
