@@ -3,6 +3,7 @@ import process from 'node:process';
 import { parseArgs } from 'node:util';
 import { copyCommand, listCommand, retryCommand, resumeCommand, UsageError } from '../src/commands.js';
 import { EXIT } from '../src/job.js';
+import { migrateCommand } from '../src/migration.js';
 import { runUi } from '../src/ui/index.js';
 
 const HELP = `azcopy-commander - append-only S3 -> Azure Blob migration controller for AzCopy
@@ -14,6 +15,8 @@ Usage:
                                                                     only list the files a copy would transfer (saves nothing)
   azcopy-commander retry  [--run <run dir>] --target-sas-url <url>   re-copy the files that failed in a run
   azcopy-commander resume [--run <run dir>] --target-sas-url <url>   continue an interrupted or failed azcopy job
+  azcopy-commander migrate --source-bucket <bucket> --target-sas-url <url> [options]   large migration in chunks, see below
+  azcopy-commander migrate [--migration <dir>] --target-sas-url <url>                  continue a migration
 
 The ui command asks for the bucket (name or ARN), the AWS keys and the SAS URL (hidden input, or taken from the
 environment), lets you pick an earlier run for delta / retry / resume, then runs the same commands. Secrets stay in
@@ -37,6 +40,20 @@ copy options:
                               --overwrite=ifSourceNewer). Default is append-only: existing blobs are never
                               touched. Nothing is ever deleted. Not valid for resume; retry reuses the
                               setting of the original run.
+
+migrate: saves an inventory of the source, analyses it, splits it into chunk files and copies the chunks with several
+azcopy jobs at once. Everything is recorded in <output-dir>/<timestamp>-migration, so it can be stopped (Ctrl+C) and continued.
+Takes the copy options above (--source-bucket, --source-prefix, --source-region, --last-copy-date, --overwrite-modified).
+  --inventory-source <s>      How the source is listed: azcopy (default, azcopy --dry-run) or s3 (ListObjectsV2 with the
+                              AWS SDK; needs "npm install"; also finds archived objects)
+  --chunk-files <n>           Most objects per chunk (default 1000000)
+  --chunk-bytes <size>        Most bytes per chunk, e.g. 500GiB or 2TiB (default 1TiB)
+  --parallel <n>              azcopy jobs at once (default 10); AZCOPY_CONCURRENCY_VALUE / AZCOPY_BUFFER_GB apply per job
+  --max-attempts <n>          Copy attempts per chunk, retries of failed files included (default 5)
+  --stop-after <phase>        inventory or chunk: stop there, to look at the analysis or the chunks first
+  --migration <dir>           Continue this migration. Without it, and without --source-bucket, the latest one in
+                              <output-dir> is shown and you are asked to confirm it (--yes skips the question).
+                              --parallel and --max-attempts can be changed when continuing.
 
 all commands:
   --output-dir <dir>          Where run directories and state.json go (default ./runs)
@@ -67,11 +84,18 @@ const options = {
   'azcopy-arg': { type: 'string', multiple: true },
   'dry-run': { type: 'boolean' },
   run: { type: 'string' },
+  'inventory-source': { type: 'string' },
+  'chunk-files': { type: 'string' },
+  'chunk-bytes': { type: 'string' },
+  parallel: { type: 'string' },
+  'max-attempts': { type: 'string' },
+  'stop-after': { type: 'string' },
+  migration: { type: 'string' },
   yes: { type: 'boolean', short: 'y' },
   help: { type: 'boolean', short: 'h' },
 };
 
-const COMMANDS = { copy: copyCommand, list: listCommand, retry: retryCommand, resume: resumeCommand };
+const COMMANDS = { copy: copyCommand, list: listCommand, retry: retryCommand, resume: resumeCommand, migrate: migrateCommand };
 const camelCase = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
 async function main() {

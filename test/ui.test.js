@@ -9,6 +9,8 @@ import { Secrets } from '../src/ui/secrets.js';
 import { Dashboard, renderDashboard } from '../src/ui/dashboard.js';
 import { colorEnabled, createStyle, unicodeSupported, visible } from '../src/ui/style.js';
 import * as realCommands from '../src/commands.js';
+import * as realMigration from '../src/migration.js';
+import { MigrationDashboard, renderMigrationDashboard } from '../src/ui/migration-dashboard.js';
 
 const SAS = 'https://acct.blob.core.windows.net/cont?sv=2022-11-02&sp=racwl&se=2099-01-01T00:00:00Z&sig=SECRETSIG123';
 const OTHER_SAS = 'https://other.blob.core.windows.net/elsewhere?sv=2022-11-02&sp=racwl&se=2099-01-01T00:00:00Z&sig=OTHERSIG456';
@@ -102,7 +104,7 @@ function spyCommands(calls, code = 0) {
     calls.push({ name, opts: { ...opts } });
     return code;
   };
-  return { listRuns: realCommands.listRuns, deltaDateFor: realCommands.deltaDateFor, copyCommand: record('copy'), listCommand: record('list'), retryCommand: record('retry'), resumeCommand: record('resume') };
+  return { listRuns: realCommands.listRuns, deltaDateFor: realCommands.deltaDateFor, copyCommand: record('copy'), listCommand: record('list'), retryCommand: record('retry'), resumeCommand: record('resume'), migrateCommand: record('migrate'), listMigrations: realMigration.listMigrations };
 }
 
 const typedCredentials = [KEY, SECRET, TOKEN, SAS];
@@ -683,4 +685,244 @@ test('Dashboard: failures and azcopy output are recorded, shown on the next redr
   dash.summary({ ...REPORT }, {});
   await flush();
   assert.ok(unsync(term.writes.at(-1)).includes('errors       403 (2) · unknown (1)'));
+});
+// ------------------------------------------------------------- chunked migrations in the wizard
+
+const migrateAnswers = (over = {}) => [pick('azcopy'), over.chunkFiles ?? '2000', over.chunkBytes ?? '500GiB', over.parallel ?? '4', true]; // inventory, objects, size, jobs, confirm
+
+test('wizard: large migration asks for the chunk limits and runs migrate with typed secrets, nothing leaked', async () => {
+  const env = {};
+  const calls = [];
+  const commands = spyCommands(calls);
+  commands.migrateCommand = async (opts) => {
+    calls.push({ name: 'migrate', opts: { ...opts }, awsKey: env.AWS_ACCESS_KEY_ID });
+    return 0;
+  };
+  const prompts = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers()]);
+  assert.equal(await runWizard({ prompts, env, baseOpts: { outputDir: 'unused' }, commands }), 0);
+  assert.equal(prompts.remaining(), 0);
+  const { opts, awsKey } = calls[0];
+  assert.equal(awsKey, KEY, 'the typed key is in the environment while it runs');
+  assert.deepEqual(
+    [opts.sourceBucket, opts.sourcePrefix, opts.sourceRegion, opts.targetSasUrl, opts.overwriteModified, opts.inventorySource, opts.chunkFiles, opts.chunkBytes, opts.parallel],
+    ['bkt', 'data', 'ap-southeast-2', SAS, false, 'azcopy', '2000', '500GiB', '4'],
+  );
+  assert.equal(opts.view, undefined, 'no dashboard without a terminal');
+  assert.deepEqual(env, {});
+  const defaults = ['Most objects in a chunk', 'Most data in a chunk', 'azcopy jobs at once'].map((m) => prompts.asked.find((a) => a.message.startsWith(m)).initialValue);
+  assert.deepEqual(defaults, ['1000000', '1TiB', '10']);
+  const summary = prompts.shown.find((s) => s.startsWith('note Summary'));
+  assert.match(summary, /Inventory +azcopy dry run/);
+  assert.match(summary, /Chunks +at most 2000 objects or 500GiB each/);
+  assert.match(summary, /Copy +4 azcopy jobs at once/);
+  for (const secret of SECRET_TEXTS) assert.ok(!prompts.shown.join('\n').includes(secret));
+});
+
+test('wizard: the chunk prompts validate their answers; the S3 inventory can be chosen', async () => {
+  const calls = [];
+  const prompts = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, pick('s3'), '10', '2TiB', '3', false, pick('quit')]);
+  assert.equal(await runWizard({ prompts, env: {}, commands: spyCommands(calls) }), 0);
+  assert.deepEqual(calls, [], 'declining runs nothing');
+  const byMessage = (m) => prompts.asked.find((a) => a.message.includes(m));
+  assert.match(byMessage('Most objects').validate('0'), /whole number/);
+  assert.match(byMessage('Most objects').validate('many'), /whole number/);
+  assert.equal(byMessage('Most objects').validate('500000'), undefined);
+  assert.match(byMessage('Most data').validate('lots'), /Invalid the chunk size/);
+  assert.equal(byMessage('Most data').validate('750 GiB'), undefined);
+  assert.match(byMessage('jobs at once').validate('-1'), /whole number/);
+  assert.deepEqual(byMessage('How is the source listed').options.map((o) => o.value), ['azcopy', 's3']);
+});
+
+/** Fabricated migration folders. */
+function fabricatedMigrations(list) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-ui-mig-'));
+  for (const x of list) {
+    fs.mkdirSync(path.join(dir, x.name));
+    if (x.manifest === false) continue;
+    fs.writeFileSync(path.join(dir, x.name, 'migration.json'), JSON.stringify({
+      kind: 'migration', startedAt: x.startedAt, outcome: x.outcome, bucket: x.bucket ?? 'bkt', prefix: x.prefix ?? '',
+      sourceBase: 'https://s3.amazonaws.com/bkt', targetBase: x.targetBase ?? 'https://acct.blob.core.windows.net/cont',
+      inventory: { status: x.inventory ?? 'done' }, chunking: { status: x.chunking ?? 'done' },
+      chunks: (x.chunks ?? []).map((status, i) => ({ id: i + 1, status, bytes: 1 })),
+    }));
+  }
+  return dir;
+}
+
+const MIGRATIONS = [
+  { name: '20261101T010000Z-migration', startedAt: '2026-11-01T01:00:00.000Z', outcome: 'success', chunks: ['success', 'success'] },
+  { name: '20261105T020000Z-migration', startedAt: '2026-11-05T02:00:00.000Z', outcome: 'interrupted', prefix: 'data', chunks: ['success', 'exhausted', 'pending', 'interrupted'] },
+  { name: '20261106T030000Z-migration', startedAt: '2026-11-06T03:00:00.000Z', outcome: 'stopped', inventory: 'done', chunking: 'pending' },
+  { name: '20261107T040000Z-migration', manifest: false },
+];
+
+test('wizard: continue a migration lists the unfinished ones, newest first, and passes the chosen folder', async () => {
+  const dir = fabricatedMigrations(MIGRATIONS);
+  const calls = [];
+  let options;
+  const prompts = fakePrompts([pick('continue'), ...typedCredentials, (o) => ((options = o.options), o.options[1].value), true]);
+  assert.equal(await runWizard({ prompts, env: {}, baseOpts: { outputDir: dir }, commands: spyCommands(calls) }), 0);
+  assert.equal(options.length, 2, 'the finished migration and the folder without migration.json are not offered');
+  assert.match(options[0].label, /^2026-11-06 03:00 {2}chunking {2}0\/0 chunks · stopped/);
+  assert.match(options[1].label, /^2026-11-05 02:00 {2}copying {3}2\/4 chunks · interrupted +bkt\/data/);
+  assert.equal(calls[0].name, 'migrate');
+  assert.equal(calls[0].opts.migration, path.join(dir, '20261105T020000Z-migration'));
+  assert.equal(calls[0].opts.targetSasUrl, SAS);
+  assert.equal(calls[0].opts.sourceBucket, undefined);
+  assert.match(prompts.shown.find((s) => s.startsWith('note Summary')), /State +copying, 2\/4 chunks done, interrupted/);
+});
+
+test('wizard: continue refuses a SAS for another target and asks for a new one; says so when nothing is unfinished', async () => {
+  const dir = fabricatedMigrations(MIGRATIONS);
+  const calls = [];
+  const prompts = fakePrompts([pick('continue'), ...typedCredentials.slice(0, 3), OTHER_SAS, pickRun(0), pick('continue'), SAS, pickRun(0), true]);
+  assert.equal(await runWizard({ prompts, env: {}, baseOpts: { outputDir: dir }, commands: spyCommands(calls) }), 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].opts.targetSasUrl, SAS);
+  assert.ok(prompts.shown.some((s) => s.startsWith('error: The SAS URL targets')));
+
+  const done = fabricatedMigrations([MIGRATIONS[0]]);
+  const none = fakePrompts([pick('continue'), pick('quit')]);
+  assert.equal(await runWizard({ prompts: none, env: {}, baseOpts: { outputDir: done }, commands: spyCommands([]) }), 0);
+  assert.ok(none.shown.some((s) => s.startsWith('warn: No unfinished migration')));
+  assert.equal(none.asked.filter((a) => a.kind === 'password').length, 0);
+});
+
+test('wizard: Ctrl+C at every step of the migration flow ends with 130 and runs nothing', async () => {
+  const script = [pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers()];
+  for (let i = 0; i < script.length; i++) {
+    const calls = [];
+    const env = {};
+    const prompts = fakePrompts([...script.slice(0, i), CANCEL]);
+    assert.equal(await runWizard({ prompts, env, commands: spyCommands(calls) }), 130, `cancel at step ${i}`);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(env, {});
+  }
+});
+
+test('wizard: a migration on a terminal gets the migration dashboard as its view', async () => {
+  const calls = [];
+  const run = async (out, answers) => runWizard({ prompts: fakePrompts(answers), env: {}, out, baseOpts: {}, commands: spyCommands(calls) });
+  await run(fakeTerminal(), [pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers()]);
+  await run(sink(), [pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers()]);
+  assert.ok(calls[0].opts.view instanceof MigrationDashboard);
+  assert.ok(calls[0].opts.view.title.startsWith('Migrating') && calls[0].opts.view.title.includes('bkt') && calls[0].opts.view.title.includes('cont'));
+  assert.equal(calls[1].opts.view, undefined);
+});
+
+// ------------------------------------------------------------- the migration dashboard
+
+const AGGREGATE = {
+  chunksTotal: 190, chunksDone: 42, chunksRunning: 4, chunksPending: 144, chunksExhausted: 1,
+  running: [{ id: 13, percent: 71 }, { id: 14, percent: 18 }, { id: 15, percent: 52 }, { id: 16, percent: 2 }],
+  copied: 3012554, ignored: 0, failed: 3, bytesDone: 44.1 * 2 ** 40, bytesTotal: 184.2 * 2 ** 40, percent: 23.9, throughput: 1.62 * 2 ** 30, etaSeconds: 90720, elapsedSeconds: 600,
+};
+const MIG_STATE = {
+  title: 'Migrating  my-bucket → files3', phase: 'copying', frame: 2, elapsedSeconds: 134, snapshot: AGGREGATE, parallel: 10,
+  speeds: [1, 2, 3, 4, 5, 6, 5, 6], failures: [{ id: 9, path: 'data/2024/big file.bin', code: '403' }], logFile: 'runs\\m\\migration.log', output: [],
+};
+const MIG_RESULT = {
+  outcome: 'partial', dir: 'runs\\m', maxAttempts: 5, chunksTotal: 190, chunksSuccess: 188, chunksExhausted: 2, chunksOpen: 0, copied: 12480000, ignored: 5, failed: 113,
+  bytesCopied: 184 * 2 ** 40, elapsedSeconds: 90000, skipped: 2, skippedFile: 'runs\\m\\chunks\\skipped.jsonl', files: { log: 'runs\\m\\migration.log', migration: 'runs\\m\\migration.json' },
+};
+
+test('renderMigrationDashboard: the copy phase shows the bar, ETA, chunk counters, running chunks, failures and log', () => {
+  const text = plain(renderMigrationDashboard(MIG_STATE, { columns: 120 }));
+  for (const part of [
+    'Migrating  my-bucket → files3', '23.9%', '44.10 TiB / 184.20 TiB', 'speed 1.62 GiB/s', 'ETA 1d 1h 12m', 'elapsed 2m 14s',
+    'chunks ✔ 42  ▶ 4  144 pending  ✖ 1', 'copied 3,012,554', '✖ failed 3',
+    '▶ 00013', '71%', '▶ 00016', '✖ 403  data/2024/big file.bin   (chunk 00009)', 'log  runs\\m\\migration.log', '▂',
+  ]) assert.ok(text.includes(part), `missing "${part}" in\n${text}`);
+  assert.ok(!text.includes('\x1b'));
+  const many = { ...AGGREGATE, chunksRunning: 40, running: Array.from({ length: 40 }, (_, i) => ({ id: i + 1, percent: i })) };
+  const crowded = plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: many }, { columns: 120 }));
+  assert.match(crowded, /\+\d+ more running/);
+  assert.ok(renderMigrationDashboard({ ...MIG_STATE, snapshot: many }, { columns: 120 }).length < 20);
+});
+
+test('renderMigrationDashboard: the inventory and analysis phases', () => {
+  const inventory = { title: 'Migrating', phase: 'inventory', provider: 'azcopy dry-run', frame: 0, elapsedSeconds: 5, inventory: { files: 1234567, bytes: 3 * 2 ** 40 } };
+  const text = plain(renderMigrationDashboard(inventory, { columns: 100 }));
+  assert.ok(text.includes('Inventory (azcopy dry-run)') && text.includes('1,234,567 objects · 3.00 TiB so far'), text);
+  assert.notEqual(text, plain(renderMigrationDashboard({ ...inventory, frame: 4 }, { columns: 100 })), 'the bar moves');
+
+  const analysis = { ...inventory, phase: 'analysis', analysis: ['12 objects, 1 KiB', 'WARNING: 2 archived object(s) cannot be copied'], chunkCount: undefined };
+  const a = plain(renderMigrationDashboard(analysis, { columns: 100 }));
+  assert.ok(a.includes('12 objects, 1 KiB') && a.includes('WARNING: 2 archived') && a.includes('cutting the inventory into chunks'));
+  assert.ok(plain(renderMigrationDashboard({ ...analysis, chunkCount: 190 }, { columns: 100 })).includes('190 chunks, starting the copy'));
+  assert.ok(plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: null }, { columns: 100 })).includes('Migrating'), 'copy phase before the first progress');
+});
+
+test('renderMigrationDashboard: no line is wider than the terminal at any width, in any phase', () => {
+  const states = [
+    MIG_STATE,
+    { ...MIG_STATE, snapshot: null },
+    { ...MIG_STATE, phase: 'inventory', inventory: { files: 12, bytes: 99 } },
+    { ...MIG_STATE, phase: 'analysis', analysis: ['x'.repeat(200)] },
+    { result: MIG_RESULT },
+  ];
+  for (const columns of [120, 80, 60, 59, 40, 36, 35, 20]) {
+    for (const state of states) {
+      for (const color of [false, true]) {
+        for (const unicode of [true, false]) {
+          const lines = renderMigrationDashboard(state, { columns, color, unicode });
+          assert.ok(lines.length > 0);
+          for (const l of lines) assert.ok(visible(l).length <= columns - 1, `${columns} columns: "${visible(l)}" is too wide`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(renderMigrationDashboard(MIG_STATE, { columns: 30 }), ['23.9% 1.62GiB/s 1d1h']);
+  assert.equal(renderMigrationDashboard(MIG_STATE, { columns: 50 }).length, 4);
+  assert.ok(plain(renderMigrationDashboard(MIG_STATE, { columns: 50 })).includes('✔ 42/190'));
+  const ascii = plain(renderMigrationDashboard(MIG_STATE, { columns: 120, unicode: false }));
+  assert.ok(ascii.includes('> 00013') && !/[✔✖▶█░│]/.test(ascii));
+});
+
+test('renderMigrationDashboard: the result panel per outcome', () => {
+  const partial = plain(renderMigrationDashboard({ result: MIG_RESULT, errorCodes: [['403', 113]] }, { columns: 110 }));
+  for (const part of [
+    'Migration completed with failed files', 'chunks 188/190 copied · 2 with failed files · 0 not finished', 'copied 12,480,000 · ignored 5 · failed 113',
+    'not copied   2 key(s) with a line break', 'errors       403 (113)', 'choose "Continue a migration" in the menu', 'folder       runs\\m', 'migration.log',
+  ]) assert.ok(partial.includes(part), `missing "${part}" in\n${partial}`);
+  const ok = { ...MIG_RESULT, outcome: 'success', chunksSuccess: 190, chunksExhausted: 0, failed: 0, skipped: 0 };
+  const okText = plain(renderMigrationDashboard({ result: ok }, { columns: 110, color: true }));
+  assert.ok(okText.includes('Migration completed') && okText.includes('\x1b[32m') && !okText.includes('Continue a migration'));
+  assert.ok(plain(renderMigrationDashboard({ result: { ...MIG_RESULT, outcome: 'failed' } }, { columns: 110, color: true })).includes('\x1b[31m'));
+  assert.ok(plain(renderMigrationDashboard({ result: { ...MIG_RESULT, outcome: 'interrupted', chunksOpen: 5 } }, { columns: 110 })).includes('Migration interrupted'));
+  assert.deepEqual(renderMigrationDashboard({ result: MIG_RESULT }, { columns: 30 }), ['188/190 chunks · 113 failed']);
+});
+
+test('MigrationDashboard: a whole migrate run on a terminal is drawn in place and ends with the result panel; nothing leaks', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-ui-mig-e2e-'));
+  const argsFile = path.join(dir, 'args.jsonl');
+  const saved = {};
+  for (const k of ['FAKE_ARGS_FILE', 'FAKE_DRYRUN_COUNT', 'FAKE_DELAY_MS', 'FAKE_FAIL_LIST', 'FAKE_EVENTS_FILE', 'FAKE_NO_TRANSFERS', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']) {
+    saved[k] = process.env[k];
+    delete process.env[k];
+  }
+  Object.assign(process.env, { FAKE_ARGS_FILE: argsFile, FAKE_DRYRUN_COUNT: '6', FAKE_DELAY_MS: '300', AWS_ACCESS_KEY_ID: KEY, AWS_SECRET_ACCESS_KEY: SECRET });
+  try {
+    const term = fakeTerminal(100);
+    term.rows = 40;
+    const view = new MigrationDashboard({ out: term, color: true, unicode: true });
+    const code = await realMigration.migrateCommand({
+      azcopyCommand: { bin: process.execPath, prefixArgs: [fileURLToPath(new URL('fixtures/fake-azcopy.js', import.meta.url))] },
+      outputDir: dir, targetSasUrl: SAS, sourceBucket: 'bkt', sourcePrefix: 'data', chunkFiles: 2, parallel: 2, view,
+    }, term);
+    assert.equal(code, 0);
+    const screen = term.writes.join('').replaceAll('\x1b[?2026h', '').replaceAll('\x1b[?2026l', '');
+    assert.ok(screen.includes('Inventory (azcopy dry-run)'), 'the inventory phase was drawn');
+    assert.ok(visible(screen).includes('▶ 00001'), 'the running chunks were drawn');
+    assert.ok(screen.includes('Migration completed') && screen.includes('chunks 3/3 copied'), 'the result panel');
+    assert.ok(!screen.includes('Migration summary') && !screen.includes('Migration: '), 'no plain output with a view');
+    assert.ok(screen.trimEnd().endsWith('\x1b[?25h'), 'cursor shown at the end');
+    for (const secret of SECRET_TEXTS) assert.ok(!screen.includes(secret), `${secret} on screen`);
+    assert.equal(term.listeners.resize?.length ?? 0, 0, 'resize listener removed');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });

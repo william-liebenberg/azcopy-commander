@@ -1,15 +1,21 @@
 import path from 'node:path';
 import process from 'node:process';
-import * as defaultCommands from '../commands.js';
+import * as baseCommands from '../commands.js';
+import * as migrationCommands from '../migration.js';
+import { parseCount, parseSize } from '../chunks.js';
 import { parseLastCopyDate } from '../dates.js';
 import { EXIT } from '../job.js';
 import { buildSourceUrl, buildTargetBase, parseBucketInput, parseTargetSasUrl, normalizePrefix } from '../urls.js';
 import { UsageError } from '../errors.js';
 import { Secrets } from './secrets.js';
 import { Dashboard } from './dashboard.js';
+import { MigrationDashboard } from './migration-dashboard.js';
 import { fit } from './style.js';
 
 export { fit };
+
+const defaultCommands = { ...baseCommands, ...migrationCommands };
+const { MIGRATION_DEFAULTS } = migrationCommands;
 
 const ENV_SAS = 'AZCOPY_COMMANDER_TARGET_SAS_URL';
 const OTHER_DATE = '__enter-a-date__';
@@ -40,6 +46,8 @@ const MENU = [
   { value: 'list', label: 'List', hint: 'show what would be copied, nothing is saved' },
   { value: 'retry', label: 'Retry failed files', hint: 'of an earlier run' },
   { value: 'resume', label: 'Resume a run', hint: 'continue an interrupted azcopy job' },
+  { value: 'migrate', label: 'Large migration (chunked)', hint: 'inventory, chunks and several azcopy jobs at once' },
+  { value: 'continue', label: 'Continue a migration', hint: 'an interrupted or unfinished chunked migration' },
   { value: 'quit', label: 'Quit' },
 ];
 
@@ -51,7 +59,7 @@ const MENU = [
  *   env       where AWS_* and AZCOPY_COMMANDER_TARGET_SAS_URL are looked up (default process.env)
  *   out, err  where the commands print
  *   baseOpts  options shared with the CLI (outputDir, planDir, azcopyPath, azcopyArg, dryRun, ...)
- *   commands  { copyCommand, listCommand, retryCommand, resumeCommand } (default: the real ones)
+ *   commands  { copyCommand, listCommand, retryCommand, resumeCommand, migrateCommand, listRuns, listMigrations, ... } (default: the real ones)
  *   columns   terminal width (default process.stdout.columns)
  */
 export async function runWizard({ prompts, env = process.env, out = process.stdout, err = process.stderr, baseOpts = {}, commands = defaultCommands, columns } = {}) {
@@ -157,12 +165,126 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
     return { bucket: parsed.bucket, prefix, region };
   }
 
+  // ---- chunked migrations
+
+  const migrationLabel = (m) => shown(`${utcMinute(m.startedAt)}  ${m.phase.padEnd(9)} ${m.chunksDone}/${m.chunksTotal} chunks · ${m.outcome.padEnd(11)} ${m.bucket ?? '?'}${m.prefix ? `/${m.prefix}` : ''}`);
+
+  /** Runs migrateCommand with the migration dashboard on a terminal (the plain output otherwise). */
+  async function runMigration(opts, target, bucket) {
+    if (out.isTTY) {
+      const container = new URL(target.base).pathname.replace(/^\/+/, '');
+      opts.view = new MigrationDashboard({ out, columns, route: [bucket, container] });
+    }
+    secrets.apply();
+    try {
+      return await commands.migrateCommand(opts, out);
+    } catch (e) {
+      if (!(e instanceof UsageError)) throw e;
+      prompts.log.error(secrets.redact(e.message));
+      return EXIT.USAGE;
+    } finally {
+      secrets.restore();
+    }
+  }
+
+  const summaryNote = (rows) => prompts.note(rows.map(([label, value]) => `${label.padEnd(10)}${fit(value, width() - 10)}`).join('\n'), 'Summary');
+
+  async function migrateFlow() {
+    await askAws();
+    await askSas();
+    const target = parseTargetSasUrl(secrets.sas.url);
+    const source = await askSource();
+    const overwriteModified = await ask(prompts.confirm({ message: 'Replace blobs that already exist when the S3 object is newer? (--overwrite-modified)', initialValue: false }));
+    const inventorySource = await ask(prompts.select({
+      message: 'How is the source listed (the inventory)?',
+      options: [
+        { value: 'azcopy', label: 'azcopy dry run', hint: 'no extra requirements' },
+        { value: 's3', label: 'S3 API (AWS SDK)', hint: 'also finds archived objects; needs npm install' },
+      ],
+    }));
+    const chunkFiles = (await ask(prompts.text({
+      message: 'Most objects in a chunk',
+      initialValue: String(MIGRATION_DEFAULTS.chunkFiles),
+      validate: validation((v) => parseCount(v.trim(), 'the number of objects')),
+    }))).trim();
+    const chunkBytes = (await ask(prompts.text({
+      message: 'Most data in a chunk (e.g. 500GiB, 2TiB)',
+      initialValue: '1TiB',
+      validate: validation((v) => parseSize(v.trim(), 'the chunk size')),
+    }))).trim();
+    const parallel = (await ask(prompts.text({
+      message: 'azcopy jobs at once',
+      initialValue: String(MIGRATION_DEFAULTS.parallel),
+      validate: validation((v) => parseCount(v.trim(), 'the number of jobs')),
+    }))).trim();
+
+    summaryNote([
+      ['Source', buildSourceUrl(source.bucket, source.prefix, source.region)],
+      ['Target', buildTargetBase(target, source.prefix)],
+      ['Inventory', inventorySource === 's3' ? 'S3 API (ListObjectsV2)' : 'azcopy dry run'],
+      ['Chunks', `at most ${chunkFiles} objects or ${chunkBytes} each`],
+      ['Copy', `${parallel} azcopy jobs at once`],
+      ['Replace', overwriteModified ? 'blobs older than the S3 object' : 'never (append-only)'],
+      ['Secrets', secrets.describe()],
+    ]);
+    if (!(await ask(prompts.confirm({ message: 'Start the migration?', initialValue: true })))) {
+      prompts.log.info('Not started.');
+      return undefined;
+    }
+    const opts = {
+      ...baseOpts,
+      targetSasUrl: secrets.sas.url,
+      sourceBucket: source.bucket,
+      sourcePrefix: source.prefix,
+      sourceRegion: source.region || undefined,
+      overwriteModified,
+      inventorySource,
+      chunkFiles,
+      chunkBytes,
+      parallel,
+    };
+    return runMigration(opts, target, source.bucket);
+  }
+
+  async function continueFlow() {
+    const candidates = commands.listMigrations(baseOpts).filter((m) => m.outcome !== 'success');
+    if (candidates.length === 0) {
+      prompts.log.warn(`No unfinished migration in ${shown(path.resolve(baseOpts.outputDir ?? 'runs'))}.`);
+      return undefined;
+    }
+    await askAws();
+    await askSas();
+    const target = parseTargetSasUrl(secrets.sas.url);
+    const picked = await ask(prompts.select({
+      message: 'Continue which migration? (times are UTC, newest first)',
+      options: candidates.map((m) => ({ value: m, label: migrationLabel(m), hint: undefined })),
+    }));
+    if (picked.targetBase !== target.base) {
+      prompts.log.error(`The SAS URL targets ${shown(target.base)}, but that migration copies to ${shown(picked.targetBase)}.`);
+      secrets.forgetSas(); // ask for another one next time
+      return undefined;
+    }
+    summaryNote([
+      ['Migration', picked.dir],
+      ['State', `${picked.phase}, ${picked.chunksDone}/${picked.chunksTotal} chunks done, ${picked.outcome}`],
+      ['Target', picked.targetBase],
+      ['Secrets', secrets.describe()],
+    ]);
+    if (!(await ask(prompts.confirm({ message: 'Continue the migration?', initialValue: true })))) {
+      prompts.log.info('Not continued.');
+      return undefined;
+    }
+    return runMigration({ ...baseOpts, targetSasUrl: secrets.sas.url, migration: picked.dir }, target, picked.bucket);
+  }
+
   // ---- one pass through the menu
 
   /** Returns an exit code, or undefined to go back to the menu. */
   async function once() {
     const action = await ask(prompts.select({ message: 'What do you want to do?', options: MENU }));
     if (action === 'quit') return EXIT.OK;
+    if (action === 'migrate') return migrateFlow();
+    if (action === 'continue') return continueFlow();
 
     let candidates = [];
     if (RUN_FILTERS[action]) {

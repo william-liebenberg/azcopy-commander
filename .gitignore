@@ -3,8 +3,6 @@
 ##
 ## Get latest from `dotnet new gitignore`
 
-!/[Bb]in/azcopy-commander.js
-
 # dotenv files
 .env
 
@@ -32,6 +30,7 @@ x86/
 [Aa][Rr][Mm]/
 [Aa][Rr][Mm]64/
 bld/
+[Bb]in/
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
@@ -490,3 +489,5 @@ $RECYCLE.BIN/
 runs/
 *.log
 
+![Bbin]/azcopy-commander.js
+local-test-scripts/

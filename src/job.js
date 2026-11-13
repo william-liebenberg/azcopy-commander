@@ -37,6 +37,7 @@ const endAndWait = (stream) => {
  *
  * `hints` = { resume, retry }: command lines shown to the user when relevant.
  * `view` shows progress and the result (see view.js); by default the plain console output on `out`.
+ * `signal` (an AbortSignal): aborting it stops azcopy like Ctrl+C does; without it the job listens to SIGINT itself.
  */
 export async function runJob(options) {
   const view = options.view ?? new PlainView(options.out ?? process.stdout);
@@ -47,7 +48,7 @@ export async function runJob(options) {
   }
 }
 
-async function runJobWithView({ runDir, command, args, env, redactor, bucket, prefix, hints = {}, view }) {
+async function runJobWithView({ runDir, command, args, env, redactor, bucket, prefix, hints = {}, view, signal }) {
   const stamp = fileTimestamp();
   const logFile = path.join(runDir, `copy-${stamp}.log`);
   const failedFile = path.join(runDir, `failed-${stamp}.jsonl`);
@@ -134,14 +135,18 @@ async function runJobWithView({ runDir, command, args, env, redactor, bucket, pr
   };
   const { child, done } = startAzcopy({ command, args, env, onMessage, onStderr });
   // Ctrl+C: ask azcopy to stop (its job plan stays on disk, so `resume` can continue) and wait for it to exit.
-  const onSigint = () => {
+  // With a `signal` the caller owns the SIGINT handler (several jobs run in one process) and aborts the signal instead.
+  const onInterrupt = () => {
     interrupted = true;
     show('WARN', 'Interrupt received - stopping azcopy...');
     child.kill('SIGINT');
   };
-  process.on('SIGINT', onSigint);
+  if (!signal) process.on('SIGINT', onInterrupt);
+  else if (signal.aborted) onInterrupt();
+  else signal.addEventListener('abort', onInterrupt, { once: true });
   const result = await done;
-  process.off('SIGINT', onSigint);
+  if (!signal) process.off('SIGINT', onInterrupt);
+  else signal.removeEventListener('abort', onInterrupt);
 
   if (result.error) {
     lastError = `Could not start azcopy: ${result.error.message} (install it from https://aka.ms/downloadazcopy or use --azcopy-path)`;

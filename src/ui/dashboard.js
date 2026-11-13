@@ -13,23 +13,23 @@ import { colorEnabled, createStyle, fit, symbolsFor, unicodeSupported, visible }
  * Every line is cut to the terminal width, so a line never wraps and the cursor arithmetic stays exact.
  */
 
-const WIDE_MIN = 60;
-const SPARK_MIN = 80;
-const NARROW_MIN = 36;
-const MAX_PANEL = 76;
-const HISTORY = 8;
-const SHOWN_FAILURES = 3;
+export const WIDE_MIN = 60;
+export const SPARK_MIN = 80;
+export const NARROW_MIN = 36;
+export const MAX_PANEL = 76;
+export const HISTORY = 8;
+export const SHOWN_FAILURES = 3;
 const MAX_OUTPUT = 10; // lines of azcopy output in the pane (fewer when the terminal is short)
-const KEPT_OUTPUT = 50;
+export const KEPT_OUTPUT = 50;
 const TICK_MS = 250;
 
-const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+export const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 /** formatDuration without the seconds once there are hours: 2h 41m. */
-const duration = (seconds) => formatDuration(seconds).replace(/(\dh \d+m) \d+s$/, '$1');
-const rate = (bytesPerSecond) => `${formatBytes(bytesPerSecond)}/s`;
+export const duration = (seconds) => formatDuration(seconds).replace(/(\dh \d+m) \d+s$/, '$1');
+export const rate = (bytesPerSecond) => `${formatBytes(bytesPerSecond)}/s`;
 
 /** `1h12m`, `5m30s`, `42s`: the two largest units without spaces, for the narrowest layouts. */
-function compactDuration(totalSeconds) {
+export function compactDuration(totalSeconds) {
   if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return '--';
   const s = Math.round(totalSeconds);
   const [d, h, m] = [Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60)];
@@ -45,7 +45,7 @@ const EMPTY_SNAPSHOT = { scanning: true, discovered: 0, copied: 0, failed: 0, ig
  * Joins `[text, style]` parts into one line of at most `width` visible characters. The part that
  * does not fit any more is shortened (middle ellipsis) and the rest is dropped.
  */
-function compose(parts, width) {
+export function compose(parts, width) {
   let left = Math.max(0, width);
   let line = '';
   for (const [text, style = (t) => t] of parts) {
@@ -61,18 +61,18 @@ function compose(parts, width) {
   return line;
 }
 
-function sparkline(values, sym) {
+export function sparkline(values, sym) {
   const max = Math.max(...values, 0);
   return values.map((v) => sym.spark[max > 0 ? Math.round((v / max) * (sym.spark.length - 1)) : 0]).join('');
 }
 
-function progressBar(width, fraction, st, sym) {
+export function progressBar(width, fraction, st, sym) {
   const filled = clamp(Math.round(fraction * width), 0, width);
   return [[sym.barFull.repeat(filled), st.green], [sym.barEmpty.repeat(width - filled), st.dim]];
 }
 
 /** A block that bounces along the bar: the total is not known yet. */
-function scanningBar(width, frame, st, sym) {
+export function scanningBar(width, frame, st, sym) {
   const block = clamp(Math.floor(width / 5), 2, width);
   const travel = Math.max(1, width - block);
   const step = (frame * 2) % (travel * 2);

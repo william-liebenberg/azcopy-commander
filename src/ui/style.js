@@ -29,13 +29,13 @@ export function createStyle(color) {
 }
 
 const UNICODE_SYMBOLS = {
-  ok: '✔', ignored: '↷', fail: '✖', arrow: '→',
+  ok: '✔', ignored: '↷', fail: '✖', run: '▶', arrow: '→',
   barFull: '█', barEmpty: '░', bar: '│', step: '◇', end: '◆',
   spinner: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
   spark: ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'],
 };
 const ASCII_SYMBOLS = {
-  ok: '*', ignored: '-', fail: 'x', arrow: '->',
+  ok: '*', ignored: '-', fail: 'x', run: '>', arrow: '->',
   barFull: '#', barEmpty: '.', bar: '|', step: 'o', end: '*',
   spinner: ['|', '/', '-', '\\'],
   spark: ['_', '.', '-', '~', '=', '+', '*', '#'],

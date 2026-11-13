@@ -297,9 +297,10 @@ test('the view gets failures with their error code and the azcopy messages that 
     delete process.env.FAKE_CHATTER;
   }
   assert.deepEqual(seen.failures, [['a b.txt', '403'], ['dir/c.txt', '403']]);
-  assert.deepEqual(seen.logs.map(([level]) => level), ['INFO', 'STDERR']);
+  // stdout and stderr are separate pipes: which line arrives first is a race
+  assert.deepEqual(seen.logs.map(([level]) => level).sort(), ['INFO', 'STDERR']);
   assert.ok(seen.logs.every(([, text]) => !/SECRETSIG123|awssecretawssecret/.test(text)), JSON.stringify(seen.logs));
-  assert.match(seen.logs[0][1], /listing .*sig=REDACTED/);
+  assert.match(seen.logs.find(([level]) => level === 'INFO')[1], /listing .*sig=REDACTED/);
   assert.deepEqual(seen.calls, ['close']);
   assert.match(fs.readFileSync(path.join(runDir('-full'), fs.readdirSync(runDir('-full')).find((f) => f.endsWith('.log'))), 'utf8'), /STDERR/);
 });
