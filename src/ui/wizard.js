@@ -5,11 +5,10 @@ import * as migrationCommands from '../migration.js';
 import { parseCount, parseSize } from '../chunks.js';
 import { parseLastCopyDate } from '../dates.js';
 import { formatBytes, formatCount } from '../format.js';
-import { EXIT } from '../job.js';
+import { EXIT } from '../errors.js';
 import { buildSourceUrl, buildTargetBase, parseBucketInput, parseTargetSasUrl, normalizePrefix } from '../urls.js';
 import { UsageError } from '../errors.js';
 import { Secrets } from './secrets.js';
-import { Dashboard } from './dashboard.js';
 import { MigrationDashboard } from './migration-dashboard.js';
 import { fit } from './style.js';
 
@@ -34,12 +33,14 @@ const PRESETS = {
   sourceRegion: { label: 'Region', check: (v) => buildSourceUrl('bucket', '', String(v).trim()) },
   overwriteModified: { label: 'Replace', check: () => {}, show: () => 'blobs older than the S3 object' },
   lastCopyDate: { label: 'Modified since', check: (v) => { if (String(v).trim() !== 'auto') parseLastCopyDate(v); } },
-  inventorySource: { label: 'Inventory', check: oneOf(['azcopy', 's3']) },
   chunkFiles: { label: 'Chunk objects', check: (v) => parseCount(String(v).trim(), 'the number of objects') },
   chunkBytes: { label: 'Chunk size', check: (v) => parseSize(String(v).trim(), 'the chunk size') },
-  parallel: { label: 'Parallel jobs', check: (v) => parseCount(String(v).trim(), 'the number of jobs') },
+  chunkMinutes: { label: 'Chunk minutes', check: (v) => parseCount(String(v).trim(), 'the number of minutes') },
+  parallel: { label: 'Chunks at once', check: (v) => parseCount(String(v).trim(), 'the number of chunks') },
+  concurrency: { label: 'Objects at once', check: (v) => parseCount(String(v).trim(), 'the number of objects') },
+  blockSize: { label: 'Block size', check: (v) => parseSize(String(v).trim(), 'the block size') },
   maxAttempts: { label: 'Max attempts', check: (v) => parseCount(String(v).trim(), 'the number of attempts') },
-  stopAfter: { label: 'Stop after', check: oneOf(['inventory', 'chunk']) },
+  stopAfter: { label: 'Stop after', check: oneOf(['inventory']) },
   repeat: { label: 'When it ends', check: () => {}, show: () => 'run deltas until one finds few objects' },
   repeatUntil: {
     label: 'Repeat until',
@@ -63,22 +64,11 @@ const validation = (check) => (value) => {
   return undefined;
 };
 
-/** Which earlier runs each action can work on (see the plan's table). */
-const RUN_FILTERS = {
-  delta: (r) => r.bucket && (r.outcome === 'success' || r.outcome === 'partial'),
-  retry: (r) => r.failed > 0,
-  resume: (r) => r.jobId && r.outcome !== 'success',
-};
-
 const MENU = [
-  { value: 'copy', label: 'Full copy', hint: 'everything not already at the target' },
-  { value: 'delta', label: 'Delta copy', hint: 'only objects modified since an earlier run or date' },
-  { value: 'list', label: 'List', hint: 'show what would be copied, nothing is saved' },
-  { value: 'retry', label: 'Retry failed files', hint: 'of an earlier run' },
-  { value: 'resume', label: 'Resume a run', hint: 'continue an interrupted azcopy job' },
-  { value: 'migrate', label: 'Large migration (chunked)', hint: 'inventory, chunks and several azcopy jobs at once' },
-  { value: 'delta-migrate', label: 'Delta migration (chunked)', hint: 'only objects modified since an earlier migration or date' },
-  { value: 'continue', label: 'Continue a migration', hint: 'an interrupted or unfinished chunked migration' },
+  { value: 'migrate', label: 'Large migration', hint: 'lists the source and copies each chunk as soon as it is listed' },
+  { value: 'delta-migrate', label: 'Delta migration', hint: 'only objects modified since an earlier migration or date' },
+  { value: 'continue', label: 'Continue a migration', hint: 'an interrupted or unfinished migration' },
+  { value: 'list', label: 'List', hint: 'show the objects of the source, nothing is saved' },
   { value: 'quit', label: 'Quit' },
 ];
 
@@ -89,10 +79,10 @@ const MENU = [
  *   prompts   the @clack/prompts module (a scripted fake in tests)
  *   env       where AWS_* and AZCOPY_COMMANDER_TARGET_SAS_URL are looked up (default process.env)
  *   out, err  where the commands print
- *   baseOpts  options shared with the CLI (outputDir, planDir, azcopyPath, azcopyArg, dryRun, ...)
+ *   baseOpts  options shared with the CLI (outputDir, dryRun)
  *   presets   the other options given on the command line (sourceBucket, parallel, targetSasUrl, ...): the wizard offers
  *             to use them instead of asking for them again
- *   commands  { copyCommand, listCommand, retryCommand, resumeCommand, migrateCommand, listRuns, listMigrations, ... } (default: the real ones)
+ *   commands  { listCommand, migrateCommand, listMigrations, deltaDateFor, ... } (default: the real ones)
  *   columns   terminal width (default process.stdout.columns)
  */
 export async function runWizard({ prompts, env = process.env, out = process.stdout, err = process.stderr, baseOpts = {}, presets = {}, commands = defaultCommands, columns } = {}) {
@@ -141,7 +131,7 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
         const missing = [['sourcePrefix', 'Prefix', '(whole bucket)'], ['sourceRegion', 'Region', '(global endpoint)']].filter(([k]) => !found.includes(k)).map(([, l, t]) => [l, t]);
         rows.splice(at, 0, ...missing);
       }
-      prompts.note(rows.map(([label, value]) => `${label.padEnd(15)}${fit(value, width() - 15)}`).join('\n'), 'From the command line');
+      prompts.note(rows.map(([label, value]) => `${label.padEnd(16)}${fit(value, width() - 16)}`).join('\n'), 'From the command line');
       if (askToUse) use = (await ask(prompts.select({
         message: 'Options given on the command line',
         options: [{ value: 'use', label: 'Use them' }, { value: 'review', label: 'Go through the questions with them filled in' }],
@@ -218,18 +208,6 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
     parseTargetSasUrl(typed).warnings.forEach((w) => prompts.log.warn(w));
   }
 
-  // ---- previous runs
-
-  const runLabel = (r) => shown(`${utcMinute(r.startedAt)}  ${r.kind.padEnd(5)} ${r.outcome.padEnd(11)} ${r.copied} copied · ${r.failed} failed · ${r.bucket ?? '?'}${r.prefix ? `/${r.prefix}` : ''}`);
-
-  async function pickRun(action, runs, extraOptions = []) {
-    const verb = { delta: 'Delta since which run?', retry: 'Retry the failed files of which run?', resume: 'Resume which run?' }[action];
-    return ask(prompts.select({
-      message: `${verb} (times are UTC, newest first)`,
-      options: [...runs.map((r) => ({ value: r, label: runLabel(r), hint: undefined })), ...extraOptions],
-    }));
-  }
-
   // ---- source
 
   async function askSource(run, cli) {
@@ -290,8 +268,8 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
    */
   async function migrateFlow({ delta = false } = {}) {
     const cli = await commandLine([
-      'sourceBucket', 'sourcePrefix', 'sourceRegion', 'overwriteModified', ...(delta ? ['lastCopyDate'] : []), 'inventorySource', 'chunkFiles', 'chunkBytes',
-      'parallel', 'maxAttempts', 'stopAfter', 'repeat', 'repeatUntil', 'repeatMax',
+      'sourceBucket', 'sourcePrefix', 'sourceRegion', 'overwriteModified', ...(delta ? ['lastCopyDate'] : []), 'chunkFiles', 'chunkBytes', 'chunkMinutes',
+      'parallel', 'concurrency', 'blockSize', 'maxAttempts', 'stopAfter', 'repeat', 'repeatUntil', 'repeatMax',
     ]);
     await askAws();
     await askSas();
@@ -334,14 +312,6 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       message: 'Replace blobs that already exist when the S3 object is newer? (--overwrite-modified)',
       initialValue: cli.found('overwriteModified') || (baseline?.overwriteModified ?? false),
     }));
-    const inventorySource = cli.has('inventorySource') ? cli.get('inventorySource') : await ask(prompts.select({
-      message: 'How is the source listed (the inventory)?',
-      initialValue: cli.initial('inventorySource', 'azcopy'),
-      options: [
-        { value: 'azcopy', label: 'azcopy dry run', hint: 'no extra requirements' },
-        { value: 's3', label: 'S3 API (AWS SDK)', hint: 'also finds archived objects; needs npm install' },
-      ],
-    }));
     const text = async (key, options) => (cli.has(key) ? String(cli.get(key)) : await ask(prompts.text({ ...options, initialValue: cli.initial(key, options.initialValue) }))).trim();
     const chunkFiles = await text('chunkFiles', {
       message: 'Most objects in a chunk',
@@ -354,11 +324,16 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       validate: validation((v) => parseSize(v.trim(), 'the chunk size')),
     });
     const parallel = await text('parallel', {
-      message: 'azcopy jobs at once',
+      message: 'Chunks copied at once',
       initialValue: String(MIGRATION_DEFAULTS.parallel),
-      validate: validation((v) => parseCount(v.trim(), 'the number of jobs')),
+      validate: validation((v) => parseCount(v.trim(), 'the number of chunks')),
     });
-    const passed = cli.extra(['maxAttempts', 'stopAfter']);
+    const concurrency = await text('concurrency', {
+      message: 'Objects copied at once in each chunk',
+      initialValue: String(MIGRATION_DEFAULTS.concurrency),
+      validate: validation((v) => parseCount(v.trim(), 'the number of objects')),
+    });
+    const passed = cli.extra(['chunkMinutes', 'blockSize', 'maxAttempts', 'stopAfter']);
 
     // A migration that stops after a phase does not run to its end, so no delta can follow it.
     let repeat = false;
@@ -388,10 +363,9 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       ['Target', buildTargetBase(target, source.prefix)],
       ['Mode', delta ? `delta, objects modified ${sinceText}` : 'full, everything not already at the target'],
       ...(carried ? [['Carried', carried.files > 0 ? `${formatCount(carried.files)} file(s) it did not copy, from ${formatCount(carried.fromChunks.length)} chunk(s), ${formatBytes(carried.bytes)}` : 'nothing (it copied everything)']] : []),
-      ['Inventory', inventorySource === 's3' ? 'S3 API (ListObjectsV2)' : 'azcopy dry run'],
-      ['Chunks', `at most ${chunkFiles} objects or ${chunkBytes} each`],
-      ['Copy', `${parallel} azcopy jobs at once${passed.maxAttempts ? `, ${passed.maxAttempts} attempts per chunk` : ''}`],
-      ...(passed.stopAfter ? [['Stops', `after the ${passed.stopAfter}`]] : []),
+      ['Chunks', `at most ${chunkFiles} objects or ${chunkBytes} each, closed after ${passed.chunkMinutes ?? MIGRATION_DEFAULTS.chunkMinutes} min`],
+      ['Copy', `as the chunks close: ${parallel} chunk(s) at once, ${concurrency} object(s) at once in each${passed.maxAttempts ? `, ${passed.maxAttempts} attempts per chunk` : ''}`],
+      ...(passed.stopAfter ? [['Stops', 'after the listing and the analysis: nothing is copied']] : []),
       ...(repeat ? [['Repeat', `until ≤ ${formatCount(Number(repeatUntil))} objects, at most ${formatCount(Number(passed.repeatMax ?? REPEAT_DEFAULTS.max))} deltas`]] : []),
       ['Replace', overwriteModified ? 'blobs older than the S3 object' : 'never (append-only)'],
       ['Secrets', secrets.describe()],
@@ -408,10 +382,10 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       sourcePrefix: source.prefix,
       sourceRegion: source.region || undefined,
       overwriteModified,
-      inventorySource,
       chunkFiles,
       chunkBytes,
       parallel,
+      concurrency,
       ...(lastCopyDate ? { lastCopyDate } : {}),
       ...(baseline ? { baselineDir: baseline.dir } : {}),
       ...(repeat ? { repeat: true, repeatUntil } : {}),
@@ -420,13 +394,16 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
   }
 
   async function continueFlow() {
-    const candidates = commands.listMigrations(baseOpts).filter((m) => m.outcome !== 'success');
+    const unfinished = commands.listMigrations(baseOpts).filter((m) => m.outcome !== 'success');
+    // A migration made with azcopy (format 1) cannot be continued; it is still a baseline for a delta migration.
+    const candidates = unfinished.filter((m) => m.format === migrationCommands.FORMAT);
     if (candidates.length === 0) {
-      prompts.log.warn(`No unfinished migration in ${shown(path.resolve(baseOpts.outputDir ?? 'runs'))}.`);
+      const old = unfinished.length > candidates.length ? ` (${unfinished.length - candidates.length} made with azcopy cannot be continued)` : '';
+      prompts.log.warn(`No unfinished migration in ${shown(path.resolve(baseOpts.outputDir ?? 'runs'))}${old}.`);
       return undefined;
     }
-    const cli = await commandLine(['parallel', 'maxAttempts'], { askToUse: false }); // the ones that can change when continuing
-    const changes = cli.extra(['parallel', 'maxAttempts']);
+    const cli = await commandLine(['parallel', 'concurrency', 'maxAttempts'], { askToUse: false }); // the ones that can change when continuing
+    const changes = cli.extra(['parallel', 'concurrency', 'maxAttempts']);
     await askAws();
     await askSas();
     const target = parseTargetSasUrl(secrets.sas.url);
@@ -463,118 +440,36 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
     if (action === 'delta-migrate') return migrateFlow({ delta: true });
     if (action === 'continue') return continueFlow();
 
-    let candidates = [];
-    if (RUN_FILTERS[action]) {
-      candidates = commands.listRuns(baseOpts).filter(RUN_FILTERS[action]);
-      if (candidates.length === 0 && action !== 'delta') {
-        const what = action === 'retry' ? 'with failed files' : 'that can be resumed';
-        prompts.log.warn(`No earlier run ${what} in ${shown(path.resolve(baseOpts.outputDir ?? 'runs'))}.`);
-        return undefined;
-      }
-    }
+    return listFlow();
+  }
 
-    // Retry and resume work on the run itself, so only the others take options from the command line.
-    const cliKeys = { copy: [], delta: ['lastCopyDate'], list: ['lastCopyDate'] }[action];
-    const cli = await commandLine(cliKeys ? ['sourceBucket', 'sourcePrefix', 'sourceRegion', 'overwriteModified', ...cliKeys] : []);
+  /** List: the objects of the source (no target, nothing saved). */
+  async function listFlow() {
+    const cli = await commandLine(['sourceBucket', 'sourcePrefix', 'sourceRegion', 'lastCopyDate']);
     await askAws();
-    await askSas();
-    const target = parseTargetSasUrl(secrets.sas.url);
-
-    const opts = { ...baseOpts, targetSasUrl: secrets.sas.url };
-    let run = null;
+    const source = await askSource(undefined, cli);
     let lastCopyDate = null;
-    let modeText;
-    const givenDate = action === 'delta' && cli.has('lastCopyDate') ? String(cli.get('lastCopyDate')).trim() : null;
-    const sinceText = (date) => `delta, objects modified ${date === 'auto' ? 'since the previous run (auto)' : `on/after ${date}`}`;
-
-    if (givenDate) {
-      lastCopyDate = givenDate === 'auto' ? 'auto' : parseLastCopyDate(givenDate).toISOString();
-      modeText = sinceText(lastCopyDate);
-    } else if (action === 'list' && cli.found('lastCopyDate')) {
+    if (cli.found('lastCopyDate')) {
       lastCopyDate = String(cli.get('lastCopyDate')).trim();
       if (lastCopyDate !== 'auto') lastCopyDate = parseLastCopyDate(lastCopyDate).toISOString();
-      modeText = `list only, nothing is copied or saved; objects modified ${lastCopyDate === 'auto' ? 'since the previous run (auto)' : `on/after ${lastCopyDate}`}`;
-    } else if (RUN_FILTERS[action]) {
-      // A delta copy needs no earlier run when a date is typed, so with none to pick it goes straight to the date.
-      const picked = action === 'delta' && candidates.length === 0 ? OTHER_DATE
-        : await pickRun(action, candidates, action === 'delta' ? [{ value: OTHER_DATE, label: 'Enter a date instead' }] : []);
-      if (picked === OTHER_DATE) {
-        const date = (await ask(prompts.text({
-          message: 'Copy objects modified on/after (ISO 8601, e.g. 2026-01-31 or 2026-01-31T14:30:00Z; no zone = UTC)',
-          initialValue: cli.initial('lastCopyDate', ''),
-          validate: validation((v) => parseLastCopyDate(v.trim())),
-        }))).trim();
-        lastCopyDate = parseLastCopyDate(date).toISOString();
-        modeText = sinceText(lastCopyDate);
-      } else {
-        run = picked;
-        if (action === 'delta') {
-          lastCopyDate = commands.deltaDateFor(run).toISOString();
-          modeText = sinceText(lastCopyDate);
-        }
-      }
     }
-    // Retry and resume work on the run itself; the others need a source.
-    let source;
-    if (action === 'retry' || action === 'resume') {
-      if (run.targetBase !== target.base) {
-        prompts.log.error(`The SAS URL targets ${shown(target.base)}, but that run copied to ${shown(run.targetBase)}.`);
-        secrets.forgetSas(); // ask for another one next time
-        return undefined;
-      }
-      source = { bucket: run.bucket, prefix: run.prefix, region: run.region };
-      modeText = action === 'retry' ? `retry the ${run.failed} failed file(s) of ${run.dir}` : `resume azcopy job ${run.jobId} of ${run.dir}`;
-    } else {
-      source = await askSource(run, cli);
-      opts.overwriteModified = cli.has('overwriteModified') || await ask(prompts.confirm({
-        message: 'Replace blobs that already exist when the S3 object is newer? (--overwrite-modified)',
-        initialValue: cli.found('overwriteModified') || (run?.overwriteModified ?? false),
-      }));
-      modeText ??= action === 'list' ? 'list only, nothing is copied or saved' : 'full copy, everything not already at the target';
-      if (action === 'delta' && run && run.targetBase !== target.base) {
-        prompts.log.warn(`That run copied to ${shown(run.targetBase)}, but the SAS URL targets ${shown(target.base)}.`);
-        if (!(await ask(prompts.confirm({ message: 'Run the delta copy against this target anyway?', initialValue: false })))) {
-          secrets.forgetSas();
-          return undefined;
-        }
-      }
-    }
-
-    const sourceUrl = buildSourceUrl(source.bucket, source.prefix, source.region);
+    const modeText = `list only, nothing is copied or saved${lastCopyDate ? `; objects modified ${lastCopyDate === 'auto' ? 'since the previous run (auto)' : `on/after ${lastCopyDate}`}` : ''}`;
     prompts.note(
       [
-        `Source   ${fit(sourceUrl, width() - 9)}`,
-        `Target   ${fit(buildTargetBase(target, source.prefix), width() - 9)}`,
+        `Source   ${fit(buildSourceUrl(source.bucket, source.prefix, source.region), width() - 9)}`,
         `Mode     ${fit(modeText, width() - 9)}`,
-        ...(action === 'copy' || action === 'delta' ? [`Replace  ${opts.overwriteModified ? 'blobs older than the S3 object' : 'never (append-only)'}`] : []),
         `Secrets  ${fit(secrets.describe(), width() - 9)}`,
       ].join('\n'),
       'Summary',
     );
-    const go = await ask(prompts.confirm({ message: { list: 'List the files?', retry: 'Start the retry?', resume: 'Resume the run?' }[action] ?? 'Start the copy?', initialValue: true }));
-    if (!go) {
+    if (!(await ask(prompts.confirm({ message: 'List the files?', initialValue: true })))) {
       prompts.log.info('Not started.');
       return undefined;
     }
-
-    // ---- run the existing command
-    if (action === 'copy' || action === 'delta' || action === 'list') {
-      Object.assign(opts, { sourceBucket: source.bucket, sourcePrefix: source.prefix, sourceRegion: source.region || undefined });
-      if (lastCopyDate) opts.lastCopyDate = lastCopyDate;
-    } else {
-      opts.run = run.dir;
-    }
-    const command = { copy: 'copyCommand', delta: 'copyCommand', list: 'listCommand', retry: 'retryCommand', resume: 'resumeCommand' }[action];
-    // On a terminal the copy shows the live dashboard; without one (tests, pipes) the plain output is used.
-    if (out.isTTY && command !== 'listCommand') {
-      const title = { retry: 'Retrying failed files', resume: 'Resuming' }[action] ?? 'Copying';
-      const container = new URL(target.base).pathname.replace(/^\/+/, '');
-      opts.view = new Dashboard({ out, columns, title, route: [source.bucket, container] });
-    }
-
+    const opts = { ...baseOpts, sourceBucket: source.bucket, sourcePrefix: source.prefix, sourceRegion: source.region || undefined, ...(lastCopyDate ? { lastCopyDate } : {}) };
     secrets.apply();
     try {
-      return await (command === 'listCommand' ? commands[command](opts, out, err) : commands[command](opts, out));
+      return await commands.listCommand(opts, out, err);
     } catch (e) {
       if (!(e instanceof UsageError)) throw e;
       prompts.log.error(secrets.redact(e.message));

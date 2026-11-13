@@ -5,7 +5,7 @@ const HAS_ZONE = /(Z|[+-]\d{2}:?\d{2})$/i;
 
 /**
  * Parses an ISO 8601 date. Values without an explicit time zone are taken as UTC,
- * never as the local time of the machine (which is what azcopy would assume), so a
+ * never as the local time of the machine, so a
  * delta run selects the same files wherever it is started.
  */
 export function parseLastCopyDate(input, now = new Date()) {
@@ -19,5 +19,5 @@ export function parseLastCopyDate(input, now = new Date()) {
   return date;
 }
 
-/** The format azcopy --include-after is documented with: ISO 8601, second precision, UTC. */
-export const toAzcopyDate = (date) => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+/** ISO 8601, second precision, UTC: the form the dates are saved and shown in. */
+export const toUtcSeconds = (date) => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
