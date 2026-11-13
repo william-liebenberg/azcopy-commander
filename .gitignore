@@ -487,6 +487,7 @@ $RECYCLE.BIN/
 *.swp
 
 runs/
+runs-e2e/
 *.log
 
 ![Bbin]/azcopy-commander.js
