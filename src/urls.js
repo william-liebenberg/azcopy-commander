@@ -13,7 +13,7 @@ const encodePath = (segments) => segments.filter(Boolean).map(encodeURIComponent
  *   my-bucket                      -> { bucket: 'my-bucket', prefix: '' }
  *   arn:aws:s3:::my-bucket         -> { bucket: 'my-bucket', prefix: '' }
  *   arn:aws:s3:::my-bucket/data/x  -> { bucket: 'my-bucket', prefix: 'data/x' }
- * Other ARNs (access points, multi-region access points) need different azcopy URLs and are rejected.
+ * Other ARNs (access points, multi-region access points) are rejected.
  */
 export function parseBucketInput(text) {
   const input = String(text ?? '').trim();
@@ -29,9 +29,8 @@ export function parseBucketInput(text) {
 }
 
 /**
- * Path-style source URL. Without `region` it uses the global endpoint (s3.amazonaws.com), the form used
- * in Microsoft's AzCopy/S3 documentation; with `region` (e.g. ap-southeast-2) the regional endpoint,
- * which azcopy recommends for a bucket in that region.
+ * Path-style source URL, used to show the source and to name it in the logs. Without `region` it uses the
+ * global endpoint (s3.amazonaws.com); with `region` (e.g. ap-southeast-2) the regional endpoint.
  */
 export function buildSourceUrl(bucket, prefix = '', region = '') {
   if (!BUCKET_RE.test(bucket ?? '')) throw new UsageError(`Invalid S3 bucket name "${bucket ?? ''}".`);
@@ -75,27 +74,6 @@ export function parseTargetSasUrl(raw, now = new Date()) {
 export const buildTargetBase = (target, subpath = '') =>
   [target.base, encodePath(normalizePrefix(subpath).split('/'))].filter(Boolean).join('/');
 
-/** Destination URL including the SAS: only ever passed to azcopy, never logged. */
-export const buildTargetUrl = (target, subpath = '') => `${buildTargetBase(target, subpath)}?${target.query}`;
-
-/**
- * Maps the `Src` azcopy reports for a failed transfer to a path relative to the source root
- * (what `--list-of-files` expects). The exact shape of Src is not documented, so accept a
- * path-style URL, a virtual-hosted URL or an already relative path.
- */
-export function relativeSourcePath(src, { bucket, prefix = '' }) {
-  const withoutQuery = String(src).split('?')[0];
-  if (!/^https?:\/\//i.test(withoutQuery)) return withoutQuery.replace(/^\/+/, '');
-
-  const url = new URL(withoutQuery);
-  let segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-  const virtualHosted = url.hostname.startsWith(`${bucket}.`);
-  if (!virtualHosted && segments[0] === bucket) segments.shift();
-  const prefixSegments = normalizePrefix(prefix).split('/').filter(Boolean);
-  if (prefixSegments.every((p, i) => segments[i] === p)) segments = segments.slice(prefixSegments.length);
-  return segments.join('/');
-}
-
 /** Removes secrets (SAS signatures, AWS credentials) from everything that is logged or printed. */
 export class Redactor {
   constructor() {
@@ -108,6 +86,7 @@ export class Redactor {
 
   redact(text) {
     const exact = this.secrets.reduce((t, s) => t.split(s).join('***'), String(text));
-    return exact.replace(/(sig(?:=|%3[dD]))[^&"'\s]+/g, '$1REDACTED');
+    // SAS signatures, and the signature, credential and session token of presigned S3 URLs.
+    return exact.replace(/((?:sig|X-Amz-Signature|X-Amz-Credential|X-Amz-Security-Token)(?:=|%3[dD]))[^&"'\s]+/gi, '$1REDACTED');
   }
 }

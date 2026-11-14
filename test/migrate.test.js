@@ -3,803 +3,666 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { parseCount, parseSize, createChunks } from '../src/chunks.js';
-import { analyseInventory, analysisLines, s3Provider, writeInventory, InventoryError } from '../src/inventory.js';
-import { MigrationProgress, formatAggregate, PlainMigrationView } from '../src/migration-view.js';
+import { ChunkWriter, writeCarriedChunks, readChunkRecords } from '../src/chunks.js';
+import { analyseInventory, analysisLines, s3Provider } from '../src/inventory.js';
+import { MigrationProgress, formatAggregate } from '../src/migration-view.js';
 import { collectCarried, listMigrations, migrateCommand, readMigration } from '../src/migration.js';
-import { copyCommand, listRuns, listCommand } from '../src/commands.js';
-import { readState } from '../src/state.js';
+import { copyChunk, createCopier, CopyError } from '../src/blob-copy.js';
+import { readState, saveState, stateKey } from '../src/state.js';
+import { fakeContainer, fakeS3, httpError, PRESIGN_SECRET } from './fakes.js';
 
 const SAS = 'https://acct.blob.core.windows.net/cont?sv=2022-11-02&sp=racwl&se=2099-01-01T00:00:00Z&sig=SECRETSIG123';
 const AWS_SECRET = 'awssecretawssecretawssecret';
-const FAKE_VARS = ['FAKE_DRYRUN_COUNT', 'FAKE_DRYRUN_COUNTS', 'FAKE_DELAY_MS', 'FAKE_FAIL_LIST', 'FAKE_NO_TRANSFERS', 'FAKE_CHATTER', 'FAKE_ALL_FAILED'];
+const SESSION_TOKEN = 'sessiontokensessiontokensessiontoken';
+const SOURCE_BASE = 'https://s3.ap-southeast-2.amazonaws.com/bkt/data';
+const DEST_BASE = 'https://acct.blob.core.windows.net/cont/data';
+const OLD = '2025-06-01T00:00:00Z';
 
 const sink = () => {
   const chunks = [];
   return { isTTY: false, write: (c) => chunks.push(String(c)), text: () => chunks.join('') };
 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** A fresh output directory and the options that point the commands at the fake azcopy. */
-function setup(fake = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-mig-'));
-  const argsFile = path.join(dir, 'args.jsonl');
-  const eventsFile = path.join(dir, 'events.txt');
-  for (const k of FAKE_VARS) delete process.env[k];
-  Object.assign(process.env, { AWS_ACCESS_KEY_ID: 'AKIATESTTESTTEST', AWS_SECRET_ACCESS_KEY: AWS_SECRET, FAKE_ARGS_FILE: argsFile, FAKE_EVENTS_FILE: eventsFile, ...fake });
-  const base = {
-    azcopyCommand: { bin: process.execPath, prefixArgs: [fileURLToPath(new URL('fixtures/fake-azcopy.js', import.meta.url))] },
-    outputDir: dir,
-    targetSasUrl: SAS,
-    sourceBucket: 'bkt',
-    sourcePrefix: 'data',
-    sourceRegion: 'ap-southeast-2',
-  };
-  const calls = () => (fs.existsSync(argsFile) ? fs.readFileSync(argsFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
-  const events = () => (fs.existsSync(eventsFile) ? fs.readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => l.split(' ')) : []);
-  const migrationDir = () => path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith('-migration')));
-  return { dir, base, calls, events, migrationDir };
-}
-
-const listCalls = (calls) => calls.filter((a) => a[0] === 'copy' && a.includes('--list-of-files'));
-const dryRunCalls = (calls) => calls.filter((a) => a.includes('--dry-run'));
-const readLines = (file) => fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-/** The migration folders of an output directory, oldest first (by their start, not their name). */
-const migrationDirs = (dir) => fs.readdirSync(dir).filter((f) => /-migration$/.test(f)).map((f) => path.join(dir, f)).sort((a, b) => readMigration(a).startedAt.localeCompare(readMigration(b).startedAt));
-const deltaDate = (m) => new Date(Date.parse(m.startedAt) - 10 * 60_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
-
-/** The most jobs that ran at once, from the start / end events of the fake. */
-function maxConcurrent(events) {
-  let now = 0;
-  let max = 0;
-  for (const [name] of events.map(([n, t]) => [n, Number(t)]).sort((a, b) => a[1] - b[1] || (a[0] === 'end' ? -1 : 1))) {
-    now += name === 'start' ? 1 : -1;
-    max = Math.max(max, now);
+/** Waits until `cond()` is true; fails after `ms`. */
+async function until(cond, ms = 5000, what = 'a condition') {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(5);
   }
-  return max;
+}
+const readLines = (file) => fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `azc-${name}-`));
+
+/** `n` objects data/f001.bin ... of `size` bytes each. */
+const many = (n, { size = 10, lastModified = OLD, name = 'f' } = {}) =>
+  Object.fromEntries(Array.from({ length: n }, (_, i) => [`data/${name}${String(i + 1).padStart(3, '0')}.bin`, { size, lastModified }]));
+
+/** A fresh output directory, a fake S3 bucket with `objects` and a fake container; `base` holds the migrate options. */
+function setup(objects, { pageSize } = {}) {
+  const dir = tmp('mig');
+  Object.assign(process.env, { AWS_ACCESS_KEY_ID: 'AKIATESTTESTTEST', AWS_SECRET_ACCESS_KEY: AWS_SECRET });
+  delete process.env.AWS_SESSION_TOKEN;
+  const s3 = fakeS3(objects, { pageSize });
+  const container = fakeContainer(s3);
+  const base = { outputDir: dir, targetSasUrl: SAS, sourceBucket: 'bkt', sourcePrefix: 'data', sourceRegion: 'ap-southeast-2', s3, container, yes: true };
+  const migrationDirs = () => fs.readdirSync(dir).filter((f) => /-migration$/.test(f)).map((f) => path.join(dir, f)).sort((a, b) => readMigration(a).startedAt.localeCompare(readMigration(b).startedAt));
+  const migrationDir = () => migrationDirs().at(-1);
+  /** Every record of the inventory chunks (not the carried ones), in chunk order. */
+  const chunkPaths = (mdir = migrationDir()) => readMigration(mdir).chunks.filter((c) => !c.carried).flatMap((c) => readChunkRecords(path.join(mdir, c.list)).map((r) => r.path));
+  return { dir, s3, container, base, migrationDir, migrationDirs, chunkPaths };
 }
 
-// ------------------------------------------------------------- sizes and chunking
+/** Every file under `dir`, recursively. */
+const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
 
-test('parseSize and parseCount', () => {
-  assert.equal(parseSize('2TiB'), 2 * 2 ** 40);
-  assert.equal(parseSize('500GiB'), 500 * 2 ** 30);
-  assert.equal(parseSize('1.5 gib'), 1.5 * 2 ** 30);
-  assert.equal(parseSize('4096'), 4096);
-  for (const bad of ['', 'GiB', '0', '5 parsecs', '-1MiB']) assert.throws(() => parseSize(bad, '--chunk-bytes'), /--chunk-bytes/);
-  assert.equal(parseCount('10', '--parallel'), 10);
-  assert.equal(parseCount(3, '--parallel'), 3);
-  for (const bad of ['0', 'x', '1.5', -2]) assert.throws(() => parseCount(bad, '--parallel'), /--parallel/);
-});
+// ------------------------------------------------------------- the chunk writer
 
-function writeRawInventory(dir, records) {
-  const file = path.join(dir, 'inventory.jsonl');
-  fs.writeFileSync(file, records.map((r) => `${JSON.stringify(r)}\n`).join(''));
-  return file;
+/** A ChunkWriter in a new folder that records the chunks it closes. */
+function writer(options = {}) {
+  const dir = tmp('chunks');
+  const closed = [];
+  const w = new ChunkWriter({ chunksDir: path.join(dir, 'chunks'), maxFiles: 100, maxBytes: 1000, onClosed: async (c, after) => closed.push({ ...c, after }), ...options }).open();
+  return { dir, w, closed };
 }
+const rec = (p, size = 1, extra = {}) => ({ path: p, key: `data/${p}`, size, ...extra });
 
-test('chunking: boundaries by files and by bytes, an oversized object alone, keys with a line break skipped', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-chunks-'));
-  const rec = (name, size) => ({ path: name, size });
-
-  // by files
-  let file = writeRawInventory(dir, ['a', 'b', 'c', 'd', 'e'].map((n) => rec(n, 1)));
-  let { chunks, skipped } = await createChunks({ inventoryFile: file, chunksDir: path.join(dir, 'chunks'), maxFiles: 2, maxBytes: 1000 });
-  assert.deepEqual(chunks.map((c) => [c.id, c.files, c.bytes, c.list]), [[1, 2, 2, 'chunks/00001.txt'], [2, 2, 2, 'chunks/00002.txt'], [3, 1, 1, 'chunks/00003.txt']]);
-  assert.equal(skipped, 0);
-  assert.deepEqual(readLines(path.join(dir, 'chunks/00001.txt')), ['a', 'b']);
-  assert.ok(!fs.existsSync(path.join(dir, 'chunks/skipped.jsonl')));
+test('ChunkWriter: boundaries by files and by bytes, an oversized object alone; resumeAfter is the last key of the chunk', async () => {
+  let { dir, w, closed } = writer({ maxFiles: 2 });
+  for (const p of ['a', 'b', 'c', 'd', 'e']) await w.add(rec(p));
+  await w.end();
+  assert.deepEqual(closed.map((c) => [c.id, c.files, c.bytes, c.list, c.after]), [[1, 2, 2, 'chunks/00001.jsonl', 'data/b'], [2, 2, 2, 'chunks/00002.jsonl', 'data/d'], [3, 1, 1, 'chunks/00003.jsonl', 'data/e']]);
+  assert.deepEqual(readChunkRecords(path.join(dir, 'chunks/00001.jsonl')), [{ path: 'a', size: 1 }, { path: 'b', size: 1 }], 'records without the full key');
+  assert.ok(!fs.readdirSync(path.join(dir, 'chunks')).some((f) => f.endsWith('.partial')));
 
   // by bytes: a chunk never goes past the limit; 40 + 30 does not fit in 60
-  file = writeRawInventory(dir, [rec('a', 40), rec('b', 30), rec('c', 30), rec('d', 20)]);
-  ({ chunks } = await createChunks({ inventoryFile: file, chunksDir: path.join(dir, 'chunks'), maxFiles: 100, maxBytes: 60 }));
-  assert.deepEqual(chunks.map((c) => [c.files, c.bytes]), [[1, 40], [2, 60], [1, 20]]);
-  assert.deepEqual(readLines(path.join(dir, 'chunks/00002.txt')), ['b', 'c']);
+  ({ w, closed } = writer({ maxBytes: 60 }));
+  for (const [p, s] of [['a', 40], ['b', 30], ['c', 30], ['d', 20]]) await w.add(rec(p, s));
+  await w.end();
+  assert.deepEqual(closed.map((c) => [c.files, c.bytes]), [[1, 40], [2, 60], [1, 20]]);
 
   // an object larger than the limit has a chunk of its own, wherever it is
-  file = writeRawInventory(dir, [rec('a', 10), rec('huge', 500), rec('b', 10), rec('c', 10)]);
-  ({ chunks } = await createChunks({ inventoryFile: file, chunksDir: path.join(dir, 'chunks'), maxFiles: 100, maxBytes: 100 }));
-  assert.deepEqual(chunks.map((c) => [c.files, c.bytes]), [[1, 10], [1, 500], [2, 20]]);
-  assert.deepEqual(readLines(path.join(dir, 'chunks/00002.txt')), ['huge']);
+  ({ w, closed } = writer({ maxBytes: 100 }));
+  for (const [p, s] of [['a', 10], ['huge', 500], ['b', 10], ['c', 10]]) await w.add(rec(p, s));
+  await w.end();
+  assert.deepEqual(closed.map((c) => [c.files, c.bytes]), [[1, 10], [1, 500], [2, 20]]);
 
-  // keys with a line break cannot be in a list of files
-  file = writeRawInventory(dir, [rec('a', 1), rec('bad\nkey', 7), rec('bad\rkey', 8), rec('b', 1)]);
-  ({ chunks, skipped } = await createChunks({ inventoryFile: file, chunksDir: path.join(dir, 'chunks'), maxFiles: 100, maxBytes: 100 }));
-  assert.equal(skipped, 2);
-  assert.deepEqual(readLines(path.join(dir, 'chunks/00001.txt')), ['a', 'b']);
-  const skippedRecords = readLines(path.join(dir, 'chunks/skipped.jsonl')).map((l) => JSON.parse(l));
-  assert.deepEqual(skippedRecords.map((r) => [r.path, r.size]), [['bad\nkey', 7], ['bad\rkey', 8]]);
-
-  // an empty inventory has no chunks
-  file = writeRawInventory(dir, []);
-  ({ chunks } = await createChunks({ inventoryFile: file, chunksDir: path.join(dir, 'chunks'), maxFiles: 2, maxBytes: 100 }));
-  assert.deepEqual(chunks, []);
+  // nothing listed: no chunk
+  ({ w, closed } = writer());
+  await w.end();
+  assert.deepEqual(closed, []);
 });
 
-// ------------------------------------------------------------- inventory
-
-test('the inventory is written as JSON lines, through .partial; a failed listing leaves no file', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-inv-'));
-  const file = path.join(dir, 'inventory.jsonl');
-  const progress = [];
-  const records = [{ path: 'a\tb c.txt', size: 10 }, { path: 'big.bin', size: 5, storageClass: 'STANDARD' }];
-  const result = await writeInventory({ file, provider: { list: async (on) => records.forEach(on) }, onProgress: (p) => progress.push(p) });
-  assert.deepEqual(result, { files: 2, bytes: 15 });
-  assert.deepEqual(progress.at(-1), { files: 2, bytes: 15 });
-  assert.deepEqual(readLines(file).map((l) => JSON.parse(l)), records); // tabs in keys survive
-  assert.ok(!fs.existsSync(`${file}.partial`));
-
-  const other = path.join(dir, 'other.jsonl');
-  await assert.rejects(writeInventory({ file: other, provider: { list: async (on) => { on(records[0]); throw new InventoryError('boom'); } } }), /boom/);
-  assert.deepEqual(fs.readdirSync(dir).sort(), ['inventory.jsonl']);
+test('ChunkWriter: a chunk is closed by age (injected clock), only once it has objects', async () => {
+  let now = 0;
+  const { w, closed } = writer({ maxAgeMs: 60_000, now: () => now });
+  await w.closeIfOld();
+  await w.add(rec('a'));
+  now = 59_999;
+  await w.closeIfOld();
+  assert.equal(closed.length, 0);
+  now = 60_000;
+  await w.closeIfOld();
+  assert.deepEqual(closed.map((c) => [c.files, c.after]), [[1, 'data/a']]);
+  now = 500_000;
+  await w.closeIfOld(); // no open chunk
+  await w.add(rec('b')); // a new chunk opens at 500,000
+  now = 559_999;
+  await w.add(rec('c'));
+  now = 560_000;
+  await w.add(rec('d')); // the chunk is old: closed before d is written
+  await w.end();
+  assert.deepEqual(closed.map((c) => c.files), [1, 2, 1]);
 });
 
-test('writing many records under backpressure adds no listeners per record (no MaxListenersExceededWarning)', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-inv-'));
-  const file = path.join(dir, 'inventory.jsonl');
-  const warnings = [];
-  const onWarning = (w) => warnings.push(w);
-  process.on('warning', onWarning);
-  try {
-    // ~100 KiB per record against the stream's 16 KiB buffer: every write reports backpressure, and the
-    // provider (like azcopy's) does not wait on the promise `onObject` returns.
-    const records = Array.from({ length: 50 }, (_, i) => ({ path: `${i}/${'x'.repeat(100_000)}`, size: i }));
-    const result = await writeInventory({ file, provider: { list: async (on) => records.forEach((r) => on(r)) } });
-    await new Promise((resolve) => setImmediate(resolve)); // process warnings are emitted on a later tick
-    assert.equal(result.files, 50);
-    assert.equal(readLines(file).length, 50);
-    assert.deepEqual(warnings.map((w) => w.name), []);
-  } finally {
-    process.off('warning', onWarning);
-  }
+test('ChunkWriter: line breaks and archived objects go to skipped.jsonl; excluded paths are counted; open() resumes cleanly', async () => {
+  const { dir, w, closed } = writer({ maxFiles: 2, exclude: new Set(['carried']) });
+  await w.add(rec('a'));
+  await w.add(rec('bad\nkey', 7));
+  await w.add(rec('cold', 5, { storageClass: 'GLACIER', archived: true }));
+  await w.add(rec('carried'));
+  await w.add(rec('b'));
+  assert.equal(closed.length, 1);
+  const at = closed[0];
+  assert.equal(at.after, 'data/b');
+  assert.deepEqual([w.skipped, w.archived, w.excluded, w.files], [2, 1, 1, 2]);
+  const skippedFile = path.join(dir, 'chunks/skipped.jsonl');
+  assert.deepEqual(readLines(skippedFile).map((l) => JSON.parse(l)).map((r) => [r.path, r.reason]), [['bad\nkey', 'line break in the key'], ['cold', 'archived (GLACIER)']]);
+  const savedBytes = w.skippedBytes;
+  assert.equal(savedBytes, fs.statSync(skippedFile).size);
+
+  // more after the last closed chunk, then the process stops: an open chunk and a skipped line past savedBytes
+  await w.add(rec('c'));
+  await w.add(rec('d\re', 3));
+  assert.ok(fs.existsSync(path.join(dir, 'chunks/00002.jsonl.partial')));
+  assert.equal(readLines(skippedFile).length, 3);
+
+  const again = new ChunkWriter({ chunksDir: path.join(dir, 'chunks'), maxFiles: 2, maxBytes: 1000, nextId: 2, skippedBytes: savedBytes }).open();
+  assert.ok(!fs.existsSync(path.join(dir, 'chunks/00002.jsonl.partial')), 'the open chunk is deleted');
+  assert.equal(readLines(skippedFile).length, 2, 'skipped.jsonl is cut back');
+  await again.add(rec('c'));
+  await again.end();
+  assert.deepEqual(readChunkRecords(path.join(dir, 'chunks/00002.jsonl')).map((r) => r.path), ['c']);
 });
 
-test('analysis: counts, size histogram, largest objects, top-level prefixes, storage classes and a warning for archived ones', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-ana-'));
-  const GiB = 2 ** 30;
-  const file = writeRawInventory(dir, [
-    { path: 'data/a.txt', size: 10, storageClass: 'STANDARD' },
-    { path: 'data/b.txt', size: 2 * 2 ** 20, storageClass: 'STANDARD' },
-    { path: 'logs/c.log', size: 5 * GiB, storageClass: 'GLACIER' },
-    { path: 'logs/d.log', size: 200 * GiB, storageClass: 'DEEP_ARCHIVE' },
-    { path: 'root.txt', size: 1 },
-  ]);
-  const summary = await analyseInventory(file);
-  assert.deepEqual([summary.files, summary.bytes], [5, 10 + 2 * 2 ** 20 + 205 * GiB + 1]);
-  assert.deepEqual(summary.sizes.map((s) => s.files), [2, 1, 1, 1]); // < 1 MiB, 1 MiB-1 GiB, 1-100 GiB, > 100 GiB
-  assert.deepEqual(summary.largest.map((l) => l.path), ['logs/d.log', 'logs/c.log', 'data/b.txt', 'data/a.txt', 'root.txt']);
-  assert.deepEqual(summary.topLevel.map((p) => [p.prefix, p.files]), [['logs/', 2], ['data/', 2], ['(root)', 1]]);
-  assert.deepEqual(summary.storageClasses.map((c) => [c.storageClass, c.files]).sort(), [['DEEP_ARCHIVE', 1], ['GLACIER', 1], ['STANDARD', 2]]);
-  assert.equal(summary.archived.files, 2);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'inventory-summary.json'), 'utf8')).files, 5);
-
-  const lines = analysisLines(summary, { shownPrefixes: 2 });
-  assert.match(lines[0], /^5 objects, 205\.00 GiB/);
-  assert.match(lines[1], /^sizes {6}< 1 MiB 2 · 1 MiB–1 GiB 1 · 1–100 GiB 1 · > 100 GiB 1/);
-  assert.match(lines[2], /^top level {2}logs\/ 2 \(205\.00 GiB\) · data\/ 2 \(.*\) · 1 more/);
-  assert.ok(lines.some((l) => /^WARNING: 2 archived object\(s\)/.test(l)));
-
-  // without a storage class (azcopy provider) there is no such part
-  const plainFile = writeRawInventory(dir, [{ path: 'x', size: 1 }]);
-  const plain = await analyseInventory(plainFile, path.join(dir, 'plain-summary.json'));
-  assert.equal(plain.storageClasses, undefined);
-  assert.ok(!analysisLines(plain).some((l) => /storage|WARNING/.test(l)));
+test('writeCarriedChunks: the carried files as the first chunks, split by --chunk-files', () => {
+  const dir = tmp('carried');
+  const chunks = writeCarriedChunks({ carried: new Map([['a', 1], ['b', 2], ['c', 3]]), chunksDir: path.join(dir, 'chunks'), maxFiles: 2 });
+  assert.deepEqual(chunks, [{ id: 1, list: 'chunks/00001.jsonl', files: 2, bytes: 3, carried: true }, { id: 2, list: 'chunks/00002.jsonl', files: 1, bytes: 3, carried: true }]);
+  assert.deepEqual(readChunkRecords(path.join(dir, 'chunks/00002.jsonl')), [{ path: 'c', size: 3 }]);
 });
 
-/** A ListObjectsV2 stand-in over `keys` ([key, size, modified, class]) with a small page size. */
-function fakeS3(keys) {
-  const requests = [];
-  const listPage = async (params) => {
-    requests.push(params);
-    const rows = keys.filter(([key]) => !params.Prefix || key.startsWith(params.Prefix));
-    const start = params.ContinuationToken ? Number(params.ContinuationToken) : 0;
-    const page = rows.slice(start, start + 2);
-    return {
-      Contents: page.map(([Key, Size, LastModified, StorageClass]) => ({ Key, Size, LastModified: new Date(LastModified), StorageClass })),
-      IsTruncated: start + 2 < rows.length,
-      NextContinuationToken: String(start + 2),
-    };
-  };
-  return { listPage, requests };
-}
+// ------------------------------------------------------------- listing and analysis
 
-const S3_KEYS = [
-  ['data/', 0, '2026-01-01T00:00:00Z'], // a folder marker
-  ['data/a.txt', 10, '2026-01-01T00:00:00Z', 'STANDARD'],
-  ['data/sub/b c.txt', 20, '2026-02-01T00:00:00Z', 'GLACIER'],
-  ['data/sub/', 0, '2026-02-01T00:00:00Z'],
-  ['data/new.txt', 30, '2026-03-01T00:00:00Z'],
-  ['other/x.txt', 99, '2026-03-01T00:00:00Z'],
-];
-
-test('S3 provider: pages, prefix, folder markers, date filter, storage class', async () => {
+test('S3 provider: pages, prefix, folder markers, date filter, StartAfter, RestoreStatus and archived objects', async () => {
+  const s3 = fakeS3({
+    'data/': { size: 0 },
+    'data/a.txt': { size: 10, lastModified: '2026-01-01T00:00:00Z' },
+    'data/sub/b c.txt': { size: 20, lastModified: '2026-02-01T00:00:00Z', storageClass: 'GLACIER' },
+    'data/sub/': { size: 0 },
+    'data/new.txt': { size: 30, lastModified: '2026-03-01T00:00:00Z', storageClass: 'DEEP_ARCHIVE', restore: { IsRestoreInProgress: false, RestoreExpiryDate: new Date(Date.now() + 86400e3) } },
+    'data/old-restore.txt': { size: 1, lastModified: '2026-03-01T00:00:00Z', storageClass: 'GLACIER', restore: { IsRestoreInProgress: false, RestoreExpiryDate: new Date(Date.now() - 1000) } },
+    'other/x.txt': { size: 99 },
+  }, { pageSize: 2 });
   const collect = async (extra = {}) => {
-    const fake = fakeS3(S3_KEYS);
+    s3.pages.length = 0;
     const seen = [];
-    await s3Provider({ bucket: 'bkt', prefix: 'data', listPage: fake.listPage, ...extra }).list((o) => seen.push(o));
-    return { seen, fake };
+    await s3Provider({ bucket: 'bkt', prefix: 'data', listPage: s3.listPage, ...extra }).list((o) => seen.push(o));
+    return seen;
   };
-  const { seen, fake } = await collect();
-  assert.deepEqual(seen.map((o) => [o.path, o.size, o.storageClass]), [['a.txt', 10, 'STANDARD'], ['sub/b c.txt', 20, 'GLACIER'], ['new.txt', 30, 'STANDARD']]);
+  const seen = await collect();
+  assert.deepEqual(seen.map((o) => [o.path, o.key, o.size, o.storageClass, Boolean(o.archived)]), [
+    ['a.txt', 'data/a.txt', 10, 'STANDARD', false],
+    ['new.txt', 'data/new.txt', 30, 'DEEP_ARCHIVE', false], // restored
+    ['old-restore.txt', 'data/old-restore.txt', 1, 'GLACIER', true], // the restored copy expired
+    ['sub/b c.txt', 'data/sub/b c.txt', 20, 'GLACIER', true],
+  ]);
   assert.equal(seen[0].lastModified, '2026-01-01T00:00:00.000Z');
-  assert.ok(fake.requests.length >= 3, 'several pages');
-  assert.ok(fake.requests.every((r) => r.Bucket === 'bkt' && r.Prefix === 'data/' && r.MaxKeys === 1000));
-  assert.equal(fake.requests[0].ContinuationToken, undefined);
+  assert.ok(s3.pages.length >= 3, 'several pages');
+  assert.ok(s3.pages.every((r) => r.Bucket === 'bkt' && r.Prefix === 'data/' && r.MaxKeys === 1000 && r.OptionalObjectAttributes[0] === 'RestoreStatus'));
 
-  const delta = await collect({ includeAfter: '2026-02-01T00:00:00Z' });
-  assert.deepEqual(delta.seen.map((o) => o.path), ['sub/b c.txt', 'new.txt'], 'on/after the date');
+  assert.deepEqual((await collect({ includeAfter: '2026-02-01T00:00:00Z' })).map((o) => o.path), ['new.txt', 'old-restore.txt', 'sub/b c.txt'], 'on/after the date');
+  assert.deepEqual((await collect({ startAfter: 'data/new.txt' })).map((o) => o.path), ['old-restore.txt', 'sub/b c.txt']);
+  assert.equal(s3.pages[0].StartAfter, 'data/new.txt');
+  assert.ok(s3.pages.slice(1).every((p) => p.StartAfter === undefined && p.ContinuationToken), 'StartAfter on the first page only');
+  assert.deepEqual((await collect({ prefix: '' })).map((o) => o.path).at(-1), 'other/x.txt');
 
-  const whole = await collect({ prefix: '' });
-  assert.deepEqual(whole.seen.map((o) => o.path), ['data/a.txt', 'data/sub/b c.txt', 'data/new.txt', 'other/x.txt']);
-  assert.equal(whole.fake.requests[0].Prefix, undefined);
-
-  await assert.rejects(s3Provider({ bucket: 'bkt', listPage: async () => { throw new Error('AccessDenied'); } }).list(() => {}), /S3 listing failed: AccessDenied/);
+  await assert.rejects(s3Provider({ bucket: 'bkt', listPage: async () => { throw Object.assign(new Error('denied'), { name: 'AccessDenied' }); } }).list(() => {}), /S3 listing failed: AccessDenied: denied/);
 });
 
-// ------------------------------------------------------------- aggregate progress
+test('analysis: read from the chunk files and skipped.jsonl; archived objects reported from the skipped records', async () => {
+  const dir = tmp('ana');
+  const GiB = 2 ** 30;
+  const write = (name, records) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, records.map((r) => `${JSON.stringify(r)}\n`).join(''));
+    return file;
+  };
+  const files = [
+    write('00001.jsonl', [{ path: 'data/a.txt', size: 10, storageClass: 'STANDARD' }, { path: 'data/b.txt', size: 2 * 2 ** 20, storageClass: 'STANDARD' }]),
+    write('00002.jsonl', [{ path: 'root.txt', size: 1 }]),
+    write('skipped.jsonl', [{ path: 'logs/c.log', size: 5 * GiB, storageClass: 'GLACIER', reason: 'archived (GLACIER)' }, { path: 'logs/d.log', size: 200 * GiB, storageClass: 'DEEP_ARCHIVE', reason: 'archived (DEEP_ARCHIVE)' }, { path: 'x\ny', size: 3, reason: 'line break in the key' }]),
+    path.join(dir, 'missing.jsonl'),
+  ];
+  const summary = await analyseInventory(files, path.join(dir, 'inventory-summary.json'));
+  assert.deepEqual([summary.files, summary.bytes], [6, 10 + 2 * 2 ** 20 + 205 * GiB + 1 + 3]);
+  assert.deepEqual(summary.sizes.map((s) => s.files), [3, 1, 1, 1]);
+  assert.deepEqual(summary.largest.map((l) => l.path).slice(0, 3), ['logs/d.log', 'logs/c.log', 'data/b.txt']);
+  assert.deepEqual(summary.topLevel.map((p) => [p.prefix, p.files]), [['logs/', 2], ['data/', 2], ['(root)', 2]]);
+  assert.deepEqual([summary.skipped.files, summary.archived.files], [3, 2]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'inventory-summary.json'), 'utf8')).files, 6);
+  const lines = analysisLines(summary, { shownPrefixes: 2 });
+  assert.match(lines[0], /^6 objects, 205\.00 GiB/);
+  assert.match(lines[2], /^top level {2}logs\/ 2 \(205\.00 GiB\) · data\/ 2 \(.*\) · 1 more/);
+  assert.ok(lines.some((l) => /^WARNING: 2 archived object\(s\) .* are skipped/.test(l)));
+});
 
-test('MigrationProgress adds finished chunks and live jobs against the inventory total', () => {
+test('MigrationProgress: while the listing runs the total has a +, and there is no ETA', () => {
   const chunks = [
-    { id: 1, bytes: 1000, status: 'success', copied: 10, ignored: 1, failed: 0, bytesCopied: 900 },
+    { id: 1, bytes: 1000, status: 'success', copied: 10, ignored: 1, missing: 1, failed: 0, bytesCopied: 900 },
     { id: 2, bytes: 1000, status: 'running', copied: 0, ignored: 0, failed: 0, bytesCopied: 0 },
     { id: 3, bytes: 1000, status: 'pending', copied: 0, ignored: 0, failed: 0, bytesCopied: 0 },
     { id: 4, bytes: 1000, status: 'exhausted', copied: 5, ignored: 0, failed: 2, bytesCopied: 400 },
   ];
   let now = 0;
-  const progress = new MigrationProgress({ chunks, totalBytes: 4000, now: () => now });
-  progress.update(2, { copied: 3, ignored: 0, failed: 1, bytesDone: 250, bytesTotal: 1000 });
+  const progress = new MigrationProgress({ chunks, now: () => now });
+  progress.listing = { files: 4200 };
+  progress.update(2, { copied: 3, ignored: 0, missing: 0, failed: 1, bytesDone: 250, bytesTotal: 1000 });
   now = 1000;
   const s = progress.snapshot(now);
   assert.deepEqual([s.chunksTotal, s.chunksDone, s.chunksRunning, s.chunksPending, s.chunksExhausted], [4, 2, 1, 1, 1]);
-  assert.deepEqual([s.copied, s.failed, s.ignored], [18, 3, 1]);
-  assert.equal(s.bytesDone, 1000 + 250 + 400); // a finished chunk counts as a whole
-  assert.equal(s.percent, (1650 / 4000) * 100);
-  assert.deepEqual(s.running, [{ id: 2, percent: 25 }]);
+  assert.deepEqual([s.copied, s.failed, s.ignored, s.missing], [18, 3, 1, 1]);
+  assert.equal(s.bytesDone, 1000 + 250 + 400);
+  assert.ok(Number.isNaN(s.etaSeconds));
+  assert.match(formatAggregate(s), /^LISTING\+COPYING \| listed 4,200 \(4 chunks\) \| chunks 2\/4 done, 1 running \| copied 18 \| ignored 1 \| missing 1 \| failed 3 \| 1\.61 KiB \/ 3\.91 KiB\+ \| .* \| ETA after listing$/);
+
+  progress.listing = null;
   progress.update(2, { copied: 6, ignored: 0, failed: 1, bytesDone: 750, bytesTotal: 1000 });
   now = 2000;
   const later = progress.snapshot(now);
-  assert.equal(later.throughput, 500); // 500 bytes in one second
+  assert.equal(later.throughput, 500);
   assert.equal(later.etaSeconds, (4000 - 2150) / 500);
-  assert.match(formatAggregate(later), /^COPYING \| chunks 2\/4 done, 1 running \| copied 21 \| failed 3 \| 2\.10 KiB \/ 3\.91 KiB \(53\.8%\) \| 500 B\/s \| ETA 4s$/);
+  assert.match(formatAggregate(later), /^COPYING \| chunks 2\/4 done, 1 running \| copied 21 \| ignored 1 \| missing 1 \| failed 3 \| 2\.10 KiB \/ 3\.91 KiB \(53\.8%\) \| 500 B\/s \| ETA 4s$/);
 });
 
-// ------------------------------------------------------------- migrate, end to end with the fake azcopy
+// ------------------------------------------------------------- the copy of one object
 
-test('migrate: inventory -> analysis -> chunks -> every chunk copied; state.json saved', async () => {
-  const { dir, base, calls, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '25' });
+/** A copier over a fake bucket and container. */
+function copier(objects, options = {}) {
+  const s3 = fakeS3(objects);
+  const container = fakeContainer(s3);
+  return { s3, container, copy: createCopier({ s3, container, prefix: 'data', ...options }) };
+}
+
+test('copier: Put Blob From URL with headers and valid metadata; append-only; S3 404 is missing; zero-byte objects', async () => {
+  const { container, copy } = copier({
+    'data/a b.txt': { size: 10, contentType: 'text/plain', metadata: { owner: 'x', 'original-filename': 'y' } },
+    'data/empty': { size: 0 },
+  });
+  assert.deepEqual(await copy({ path: 'a b.txt' }), { result: 'copied', bytes: 10, invalidMetadata: ['original-filename'] });
+  const blob = container.blobs.get('data/a b.txt');
+  assert.deepEqual([blob.size, blob.from, blob.headers.blobContentType, blob.metadata], [10, 'data/a b.txt', 'text/plain', { owner: 'x' }]);
+  assert.deepEqual(container.requests[0].conditions, { ifNoneMatch: '*' });
+
+  // the blob exists: ignored, its content unchanged
+  const before = container.blobs.get('data/a b.txt');
+  assert.equal((await copy({ path: 'a b.txt' })).result, 'ignored');
+  assert.equal(container.blobs.get('data/a b.txt'), before);
+
+  assert.deepEqual(await copy({ path: 'gone' }), { result: 'missing', bytes: 0 });
+  assert.equal((await copy({ path: 'empty' })).result, 'copied');
+  assert.deepEqual([container.blobs.get('data/empty').size, container.blobs.get('data/empty').from], [0, 'upload']);
+});
+
+test('copier: --overwrite-modified writes an older blob again and ignores a newer one', async () => {
+  const { container, copy } = copier({ 'data/old.txt': { size: 5, lastModified: '2026-02-01T00:00:00Z' }, 'data/new.txt': { size: 6, lastModified: '2026-02-01T00:00:00Z' } }, { overwriteModified: true });
+  container.seed('data/old.txt', { lastModified: '2026-01-01T00:00:00Z' });
+  container.seed('data/new.txt', { lastModified: '2026-03-01T00:00:00Z' });
+  assert.equal((await copy({ path: 'old.txt' })).result, 'copied');
+  assert.equal(container.blobs.get('data/old.txt').size, 5);
+  assert.equal((await copy({ path: 'new.txt' })).result, 'ignored');
+  assert.equal(container.blobs.get('data/new.txt').from, 'seed');
+  assert.deepEqual(container.requests.filter((r) => r.name === 'data/old.txt').map((r) => Object.keys(r.conditions)), [['ifNoneMatch'], ['ifUnmodifiedSince']]);
+});
+
+test('copier: above the block size, staged blocks with ids of equal length, then one commit; an existing blob stages nothing', async () => {
+  const { s3, container, copy } = copier({ 'data/big.bin': { size: 25 }, 'data/there.bin': { size: 30 } }, { blockSize: 10 });
+  assert.equal((await copy({ path: 'big.bin' })).result, 'copied');
+  const stages = container.requests.filter((r) => r.request === 'stage');
+  assert.deepEqual(stages.map((r) => [r.block.offset, r.block.count]), [[0, 10], [10, 10], [20, 5]]);
+  assert.equal(new Set(stages.map((r) => r.block.id.length)).size, 1);
+  const commits = container.requests.filter((r) => r.request === 'commit');
+  assert.equal(commits.length, 1);
+  assert.deepEqual(commits[0].ids, stages.map((r) => r.block.id));
+  assert.deepEqual(commits[0].conditions, { ifNoneMatch: '*' });
+  assert.equal(container.blobs.get('data/big.bin').size, 25);
+  assert.equal(s3.presigned, 3, 'one presigned URL per block');
+
+  container.seed('data/there.bin');
+  container.requests.length = 0;
+  assert.equal((await copy({ path: 'there.bin' })).result, 'ignored');
+  assert.deepEqual(container.requests.map((r) => r.request), ['properties']);
+});
+
+test('copier: a presigned URL longer than 2 KiB fails with SourceUrlTooLong without calling Azure', async () => {
+  const { s3, container, copy } = copier({ 'data/a.txt': { size: 10 } });
+  s3.longUrl = () => true;
+  await assert.rejects(copy({ path: 'a.txt' }), (e) => e instanceof CopyError && e.code === 'SourceUrlTooLong');
+  assert.equal(container.requests.length, 0);
+});
+
+test('copyChunk: counts, failed list without query strings, log with the invalid metadata names, run.json', async () => {
+  const { s3, container, copy } = copier({ 'data/a.txt': { size: 1, metadata: { 'bad-name': '1' } }, 'data/b c.txt': { size: 2 }, 'data/c.txt': { size: 3 }, 'data/d.txt': { size: 4 } });
+  container.seed('data/c.txt');
+  container.fail = (name) => (name === 'data/b c.txt' ? httpError(403, 'AuthorizationFailure') : null);
+  const runDir = path.join(tmp('chunk'), 'run');
+  const snapshots = [];
+  const failures = [];
+  const report = await copyChunk({
+    records: [{ path: 'a.txt', size: 1 }, { path: 'b c.txt', size: 2 }, { path: 'c.txt', size: 3 }, { path: 'd.txt', size: 4 }, { path: 'gone.txt', size: 5 }],
+    concurrency: 2,
+    copy,
+    runDir,
+    manifest: { kind: 'chunk', chunk: 1 },
+    sourceBase: SOURCE_BASE,
+    destBase: DEST_BASE,
+    onProgress: (s) => snapshots.push(s),
+    onFailure: (p, code) => failures.push([p, code]),
+  });
+  assert.deepEqual([report.outcome, report.copied, report.ignored, report.missing, report.failed, report.bytesCopied], ['partial', 2, 1, 1, 1, 5]);
+  assert.deepEqual(failures, [['b c.txt', 'AuthorizationFailure']]);
+  assert.deepEqual(snapshots.at(-1), { copied: 2, ignored: 1, missing: 1, failed: 1, bytesDone: 15, bytesTotal: 15 });
+  assert.deepEqual(readLines(report.files.failed).map((l) => JSON.parse(l)), [{ relativePath: 'b c.txt', src: `${SOURCE_BASE}/b%20c.txt`, dst: `${DEST_BASE}/b%20c.txt`, errorCode: 'AuthorizationFailure', size: 2 }]);
+  const log = fs.readFileSync(report.files.log, 'utf8');
+  assert.match(log, /metadata left out \(not a valid Azure metadata name\): bad-name/);
+  assert.match(log, /missing at the source .*gone\.txt/);
+  assert.match(log, /partial: copied 2, ignored 1 \(already at the target\), missing 1, failed 1/);
+  const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'run.json'), 'utf8'));
+  assert.deepEqual([manifest.kind, manifest.outcome, manifest.files, manifest.copied, manifest.failed], ['chunk', 'partial', 5, 2, 1]);
+  assert.ok(!/X-Amz|PRESIGN/.test(log + fs.readFileSync(report.files.failed, 'utf8')));
+  assert.equal(s3.heads.length, 5);
+});
+
+// ------------------------------------------------------------- migrate, end to end with the fakes
+
+const MIXED = {
+  'data/': { size: 0 },
+  'data/a b.txt': { size: 10, contentType: 'text/plain', metadata: { owner: 'me' } },
+  'data/dir/': { size: 0 },
+  'data/dir/c.txt': { size: 20 },
+  'data/é ü/ñ.txt': { size: 30 },
+  'data/bad\nkey': { size: 7 },
+  'data/cold.bin': { size: 40, storageClass: 'GLACIER' },
+  'data/warm.bin': { size: 50, storageClass: 'GLACIER', restore: { IsRestoreInProgress: false } },
+  'data/empty': { size: 0 },
+  'other/x.txt': { size: 99 },
+};
+
+test('migrate: list into chunks and copy them; every object at its name and size; skipped keys; state.json and analysis', async () => {
+  const { dir, base, container, migrationDir, chunkPaths } = setup(MIXED, { pageSize: 2 });
   const out = sink();
-  const code = await migrateCommand({ ...base, chunkFiles: 10, parallel: 2 }, out);
-  assert.equal(code, 0, out.text());
-
+  assert.equal(await migrateCommand({ ...base, chunkFiles: '2' }, out), 0, out.text());
   const mdir = migrationDir();
-  const m = readMigration(mdir);
-  assert.equal(m.outcome, 'success');
-  assert.deepEqual([m.inventory.status, m.inventory.files, m.inventory.bytes], ['done', 25, 10 * (25 * 26) / 2]);
-  assert.deepEqual([m.chunking.status, m.chunking.chunks, m.chunking.skipped], ['done', 3, 0]);
-  assert.deepEqual(m.chunks.map((c) => [c.id, c.files, c.status, c.attempts, c.runs.length]), [[1, 10, 'success', 1, 1], [2, 10, 'success', 1, 1], [3, 5, 'success', 1, 1]]);
-  assert.equal(m.sourceBase, 'https://s3.ap-southeast-2.amazonaws.com/bkt/data');
-  assert.equal(m.targetBase, 'https://acct.blob.core.windows.net/cont');
-  assert.equal(m.chunks.reduce((s, c) => s + c.copied, 0), 25);
+  assert.match(path.basename(mdir), /^\d{8}T\d{6}Z-migration$/);
+  const expected = ['data/a b.txt', 'data/dir/c.txt', 'data/empty', 'data/warm.bin', 'data/é ü/ñ.txt'];
+  assert.deepEqual([...container.blobs.keys()].sort(), expected);
+  for (const name of expected) assert.equal(container.blobs.get(name).size, MIXED[name].size);
+  assert.deepEqual(container.blobs.get('data/a b.txt').metadata, { owner: 'me' });
 
-  // the folder: inventory, summary, chunk lists with paths relative to the source root, chunk runs
-  const inventory = readLines(path.join(mdir, 'inventory.jsonl')).map((l) => JSON.parse(l));
-  assert.deepEqual(inventory[0], { path: 'd1/obj-00001.bin', size: 10 });
-  assert.equal(JSON.parse(fs.readFileSync(path.join(mdir, 'inventory-summary.json'), 'utf8')).files, 25);
-  assert.deepEqual(readLines(path.join(mdir, 'chunks/00003.txt')), inventory.slice(20).map((r) => r.path));
-  assert.ok(fs.readdirSync(mdir).some((f) => /^migration-\d{8}T\d{6}Z\.log$/.test(f)));
+  const m = readMigration(mdir);
+  assert.equal(m.format, 2);
+  assert.equal(m.outcome, 'success');
+  assert.deepEqual([m.inventory.status, m.inventory.files, m.inventory.skipped, m.inventory.archived], ['done', 5, 2, 1]);
+  assert.equal(m.inventory.resumeAfter, 'data/é ü/ñ.txt');
+  assert.ok(m.chunks.length >= 3 && m.chunks.every((c) => c.status === 'success' && c.attempts === 1 && c.list.endsWith('.jsonl')));
+  assert.equal(m.chunks.reduce((s, c) => s + c.copied, 0), 5);
+  assert.deepEqual(chunkPaths(mdir).sort(), expected.map((p) => p.slice('data/'.length)).sort());
+  const skipped = readLines(path.join(mdir, 'chunks/skipped.jsonl')).map((l) => JSON.parse(l));
+  assert.deepEqual(skipped.map((r) => [r.path, r.reason]).sort(), [['bad\nkey', 'line break in the key'], ['cold.bin', 'archived (GLACIER)']]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(mdir, 'inventory-summary.json'), 'utf8')).files, 7);
+  assert.ok(!walk(mdir).some((f) => f.endsWith('.partial') || f.endsWith('inventory.jsonl')));
+  // one attempt folder per chunk, with its files
   const run = path.join(mdir, m.chunks[0].runs[0]);
-  assert.ok(/chunks[\\/]00001[\\/]\d{8}T\d{6}Z-chunk$/.test(run));
-  assert.deepEqual(fs.readdirSync(run).filter((f) => /^(run\.json|copy-.*\.log|azcopy-plans|azcopy-logs)$/.test(f)).length, 4);
-  const runJson = JSON.parse(fs.readFileSync(path.join(run, 'run.json'), 'utf8'));
-  assert.deepEqual([runJson.kind, runJson.chunk, runJson.outcome], ['chunk', 1, 'success']);
+  assert.ok(fs.existsSync(path.join(run, 'run.json')) && fs.readdirSync(run).some((f) => /^copy-.*\.log$/.test(f)));
 
-  // the azcopy commands: one dry run, then three list-of-files copies from the same source to the same target
-  assert.equal(dryRunCalls(calls()).length, 1);
-  const copies = listCalls(calls());
-  assert.equal(copies.length, 3);
-  for (const args of copies) {
-    assert.equal(args[1], 'https://s3.ap-southeast-2.amazonaws.com/bkt/data');
-    assert.ok(args[2].startsWith('https://acct.blob.core.windows.net/cont/data?') && args.includes('--overwrite=false') && !args.includes('--include-after'));
-  }
-  assert.deepEqual(copies.map((a) => path.basename(a[a.indexOf('--list-of-files') + 1])).sort(), ['00001.txt', '00002.txt', '00003.txt']);
-
-  // the delta baseline is the start of the migration, so `--last-copy-date auto` works afterwards
   const state = readState(path.join(dir, 'state.json'));
-  assert.deepEqual(Object.values(state).map((s) => [s.startedAt, s.runDir]), [[m.startedAt, mdir]]);
-  await copyCommand({ ...base, lastCopyDate: 'auto' }, sink());
-  assert.ok(calls().findLast((a) => a[0] === 'copy').includes('--include-after'));
-
-  assert.match(out.text(), /Inventory \(azcopy dry-run\) of https:\/\/s3\.ap-southeast-2\.amazonaws\.com\/bkt\/data/);
-  assert.match(out.text(), /25 objects, 3\.17 KiB/);
-  assert.match(out.text(), /Chunks: 3 \(≤ 10 objects or ≤ 1\.00 TiB each\)/);
-  assert.match(out.text(), /Copying 3 chunk\(s\), 2 at a time/);
-  assert.match(out.text(), /chunk 00001 success {3}copied 10 {2}ignored 0 {2}failed 0/);
-  assert.match(out.text(), /Status: +Migration completed\n.*Chunks: +3 copied/s);
+  assert.equal(state[stateKey(SOURCE_BASE, DEST_BASE)].runDir, mdir);
+  const text = out.text();
+  assert.match(text, /Inventory \(S3 ListObjectsV2\)/);
+  assert.match(text, /Not copied: {7}2 key\(s\) \(1 archived \(not restored\), 1 with a line break\)/);
+  assert.match(text, /Status: {11}Migration completed/);
 });
 
-test('migrate: never more than --parallel jobs at once, chunks started in order, a slot is refilled when a job ends', async () => {
-  const { base, calls, events, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '12', FAKE_DELAY_MS: '250' });
-  const view = new PlainMigrationView(sink());
-  const order = [];
-  view.chunkStarted = (id) => order.push(id);
-  const began = Date.now();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, parallel: 3, view }, sink()), 0);
-  assert.equal(listCalls(calls()).length, 6);
-  assert.equal(maxConcurrent(events()), 3);
-  assert.deepEqual(order, [1, 2, 3, 4, 5, 6]);
-  assert.ok(Date.now() - began < 6 * 250 + 3000, 'not one after the other');
-  // the first three jobs are chunks 1-3 (the fake azcopy processes race each other to write their line)
-  assert.deepEqual(listCalls(calls()).slice(0, 3).map((a) => path.basename(a[a.indexOf('--list-of-files') + 1])).sort(), ['00001.txt', '00002.txt', '00003.txt']);
-
-  // each job has its own plan and log folders
-  const m = readMigration(migrationDir());
-  const planDirs = new Set(m.chunks.map((c) => JSON.parse(fs.readFileSync(path.join(migrationDir(), c.runs[0], 'run.json'), 'utf8')).planDir));
-  assert.equal(planDirs.size, 6);
+test('migrate: copying starts while the listing runs (page 3 is held until chunk 1 is copied)', async () => {
+  const { base, s3, container, migrationDir } = setup(many(8), { pageSize: 2 });
+  let held = false;
+  s3.beforePage = async (n) => {
+    if (n !== 2) return;
+    held = true;
+    await until(() => ['data/f001.bin', 'data/f002.bin'].every((k) => container.blobs.has(k)), 5000, 'chunk 1 to be copied');
+  };
+  assert.equal(await migrateCommand({ ...base, chunkFiles: '2' }, sink()), 0);
+  assert.ok(held);
+  assert.equal(container.blobs.size, 8);
+  assert.equal(readMigration(migrationDir()).chunks.length, 4);
 });
 
-test('migrate: --plan-dir is split per chunk so jobs that run at once do not share a plan folder', async () => {
-  const { dir, base } = setup({ FAKE_DRYRUN_COUNT: '4' });
-  const planDir = path.join(dir, 'plans');
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, planDir }, sink()), 0);
-  const m = readMigration(path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith('-migration'))));
-  const dirs = m.chunks.map((c) => JSON.parse(fs.readFileSync(path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith('-migration')), c.runs[0], 'run.json'), 'utf8')).planDir);
-  assert.equal(new Set(dirs).size, 2);
-  assert.ok(dirs.every((d) => d.startsWith(planDir)));
+test('migrate: a delta that finds 3 objects in a long listing copies them before the listing ends (--chunk-minutes)', async () => {
+  const objects = { ...many(3, { name: 'a-new', lastModified: '2026-02-01T00:00:00Z' }), ...many(40, { name: 'z-old' }) };
+  const { base, s3, container } = setup(objects, { pageSize: 2 });
+  let clock = 0;
+  const lastPage = 21; // 43 keys, 2 per page
+  s3.beforePage = async (n) => {
+    clock += 60_000; // each page takes a minute
+    if (n === lastPage) await until(() => container.blobs.size === 3, 5000, 'the 3 modified objects to be copied');
+  };
+  assert.equal(await migrateCommand({ ...base, lastCopyDate: '2026-01-01', chunkMinutes: '1', now: () => clock }, sink()), 0);
+  assert.equal(s3.pages.length, lastPage + 1);
+  assert.deepEqual([...container.blobs.keys()].sort(), Object.keys(objects).filter((k) => k.includes('a-new')));
 });
 
-test('migrate: failed files are retried (from the failed list) up to --max-attempts', async () => {
-  // d1/obj-00001.bin fails the first two times: partial, retry (partial), retry (success)
-  const { base, calls, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '4', FAKE_FAIL_LIST: 'd1/obj-00001.bin:2' });
+test('migrate: never more than --parallel chunks and --concurrency objects at once', async () => {
+  const { base, s3, container } = setup(many(30), { pageSize: 5 });
+  s3.delayMs = 5;
+  container.delayMs = 5;
+  let running = 0;
+  let maxRunning = 0;
+  const view = {
+    chunkStarted: () => (maxRunning = Math.max(maxRunning, ++running)),
+    chunkEnded: () => running--,
+    message() {},
+    failure() {},
+    log() {},
+    summary() {},
+  };
+  assert.equal(await migrateCommand({ ...base, chunkFiles: '5', parallel: '2', concurrency: '3', view }, sink()), 0);
+  assert.equal(container.blobs.size, 30);
+  assert.equal(maxRunning, 2);
+  assert.ok(s3.maxHeadsInFlight <= 6 && container.maxWritesInFlight <= 6, `${s3.maxHeadsInFlight} / ${container.maxWritesInFlight}`);
+  assert.ok(container.maxWritesInFlight > 3, 'chunks were copied at the same time');
+});
+
+test('migrate: failed files are tried again alone; a chunk out of attempts is exhausted and the outcome partial; a delta carries them', async () => {
+  const { base, container, migrationDirs } = setup(many(4), { pageSize: 10 });
+  let fails = 1;
+  container.fail = (name) => (name === 'data/f002.bin' && fails-- > 0 ? httpError(500, 'InternalError') : null);
+  assert.equal(await migrateCommand({ ...base, chunkFiles: '2' }, sink()), 0);
+  let m = readMigration(migrationDirs()[0]);
+  assert.deepEqual(m.chunks.map((c) => [c.status, c.attempts, c.copied, c.failed]), [['success', 2, 2, 0], ['success', 1, 2, 0]]);
+  assert.equal(m.chunks[0].lastAction, 'retry');
+  const retried = path.join(migrationDirs()[0], m.chunks[0].runs[1], 'run.json');
+  assert.equal(JSON.parse(fs.readFileSync(retried, 'utf8')).files, 1, 'the retry copies only the failed path');
+
+  // a file that always fails: exhausted after --max-attempts
+  const second = setup(many(5), { pageSize: 10 });
+  second.container.fail = (name) => (name === 'data/f005.bin' ? httpError(403, 'AuthorizationPermissionMismatch') : null);
   const out = sink();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, parallel: 1 }, out), 0, out.text());
-  const m = readMigration(migrationDir());
-  assert.deepEqual(m.chunks.map((c) => [c.status, c.attempts, c.runs.length, c.failed]), [['success', 3, 3, 0], ['success', 1, 1, 0]]);
-  const lists = listCalls(calls()).map((a) => path.basename(a[a.indexOf('--list-of-files') + 1]));
-  assert.deepEqual(lists, ['00001.txt', 'retry-input.txt', 'retry-input.txt', '00002.txt']);
-  const retryList = path.join(migrationDir(), m.chunks[0].runs[1], 'retry-input.txt');
-  assert.deepEqual(readLines(retryList), ['d1/obj-00001.bin'], 'only the failed file');
-  assert.equal(m.chunks[0].copied, 1 + 0 + 1, 'copied counts add up over the attempts: 1, then 0, then 1');
-});
-
-test('migrate: a chunk that keeps failing is exhausted; the outcome is partial; continuing tries it again', async () => {
-  const { dir, base, calls, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '4', FAKE_FAIL_LIST: 'd2/obj-00002.bin' });
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, maxAttempts: 2 }, out), 1);
-  const mdir = migrationDir();
-  let m = readMigration(mdir);
+  assert.equal(await migrateCommand({ ...second.base, chunkFiles: '10', maxAttempts: '2' }, out), 1);
+  m = readMigration(second.migrationDir());
+  assert.deepEqual(m.chunks.map((c) => [c.status, c.lastOutcome, c.attempts, c.failed]), [['exhausted', 'partial', 2, 1]]);
   assert.equal(m.outcome, 'partial');
-  assert.deepEqual(m.chunks.map((c) => [c.status, c.attempts, c.lastOutcome]), [['exhausted', 2, 'partial'], ['success', 1, undefined]]);
-  assert.equal(listCalls(calls()).length, 3);
-  assert.match(out.text(), /Migration completed with failed files/);
-  assert.ok(readState(path.join(dir, 'state.json')), 'a partial migration still moves the delta date');
-  assert.ok(listMigrations({ outputDir: dir })[0].chunksDone === 2);
+  assert.match(out.text(), /Files failed: {5}1/);
 
-  // The files work now: continuing gives the exhausted chunk new attempts, and nothing else is copied again.
-  delete process.env.FAKE_FAIL_LIST;
-  const before = calls().length;
-  assert.equal(await migrateCommand({ ...base, migration: mdir }, sink()), 0);
-  m = readMigration(mdir);
-  assert.deepEqual(m.chunks.map((c) => [c.status, c.attempts]), [['success', 1], ['success', 1]]);
-  assert.equal(calls().length - before, 1, 'one retry job, no inventory');
-  assert.equal(m.outcome, 'success');
+  // the delta carries the failed file into its first chunk; a carried key modified since stays in its carried chunk
+  second.container.fail = () => null;
+  second.s3.put('data/f005.bin', { size: 10 }); // modified now
+  second.s3.put('data/g-new.bin', { size: 3 });
+  assert.equal(await migrateCommand({ ...second.base, lastCopyDate: 'auto' }, sink()), 0);
+  const delta = second.migrationDir();
+  assert.match(path.basename(delta), /-delta-migration$/);
+  const d = readMigration(delta);
+  assert.deepEqual(d.chunks.map((c) => [c.id, Boolean(c.carried), c.files]), [[1, true, 1], [2, false, 1]]);
+  assert.deepEqual(readChunkRecords(path.join(delta, d.chunks[0].list)).map((r) => r.path), ['f005.bin']);
+  assert.deepEqual(second.chunkPaths(delta), ['g-new.bin']);
+  assert.equal(d.carried.inListing, 1);
+  assert.equal(second.container.writeCount.get('data/f005.bin'), 1);
+  assert.ok(second.container.blobs.has('data/g-new.bin'));
 });
 
-test('migrate: a retry pass where every file fails (azcopy: Failed) stays partial, and a delta carries only those files', async () => {
-  const { dir, base, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '3', FAKE_FAIL_LIST: 'd2/obj-00002.bin', FAKE_ALL_FAILED: '1' });
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, maxAttempts: 2 }, out), 1, out.text());
-  const mdir = migrationDir();
-  const m = readMigration(mdir);
-  assert.equal(m.outcome, 'partial');
-  const [c] = m.chunks;
-  assert.deepEqual([c.status, c.attempts, c.lastOutcome, c.copied, c.failed], ['exhausted', 2, 'partial', 2, 1]);
-  assert.ok(readState(path.join(dir, 'state.json')), 'the baseline is recorded');
-  assert.deepEqual([...collectCarried(mdir).paths.keys()], ['d2/obj-00002.bin'], 'only the failed file is carried');
-});
-
-test('migrate: a first pass where every file fails (azcopy: Failed) is failed', async () => {
-  const { dir, base, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '1', FAKE_FAIL_LIST: 'd1/obj-00001.bin', FAKE_ALL_FAILED: '1' });
-  assert.equal(await migrateCommand({ ...base, maxAttempts: 1 }, sink()), 2);
-  assert.equal(readMigration(migrationDir()).chunks[0].lastOutcome, 'failed');
-  assert.ok(!fs.existsSync(path.join(dir, 'state.json')));
-});
-
-test('migrate: an interrupted migration continues without listing or chunking again; the running job is resumed', async () => {
-  const { base, calls, events, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '6', FAKE_DELAY_MS: '2000' });
-  const abort = new AbortController();
-  const out = sink();
-  const running = migrateCommand({ ...base, chunkFiles: 2, parallel: 1, abortSignal: abort.signal }, out);
-  while (events().length === 0) await sleep(20); // the first job has started
-  abort.abort();
-  assert.equal(await running, 130, out.text());
-
+test('migrate: Ctrl+C during the listing; continuing lists again after the last closed chunk and every key is in one chunk', async () => {
+  const keys = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'g\nbad', 'h', 'i', 'j'];
+  const { base, s3, container, migrationDir, chunkPaths } = setup(Object.fromEntries(keys.map((k) => [`data/${k}`, { size: 1 }])), { pageSize: 2 });
+  const ctrlC = new AbortController();
+  s3.beforePage = async (n) => {
+    if (n === 4) ctrlC.abort(); // pages: [a b] [c d] [e f] [g g\nbad] | [h i] [j]
+  };
+  assert.equal(await migrateCommand({ ...base, chunkFiles: '3', abortSignal: ctrlC.signal }, sink()), 130);
   const mdir = migrationDir();
   let m = readMigration(mdir);
   assert.equal(m.outcome, 'interrupted');
-  assert.deepEqual([m.inventory.status, m.chunking.status], ['done', 'done']);
-  assert.deepEqual(m.chunks.map((c) => c.status), ['interrupted', 'pending', 'pending']);
-  assert.equal(listCalls(calls()).length, 1, 'no new job started after the interrupt');
-  assert.match(out.text(), /Status: +Migration interrupted/);
-  assert.match(out.text(), /Continue: +azcopy-commander migrate --migration/);
-  const inventoryStat = fs.statSync(path.join(mdir, 'inventory.jsonl')).mtimeMs;
-  const chunkStat = fs.statSync(path.join(mdir, 'chunks/00001.txt')).mtimeMs;
+  assert.deepEqual([m.inventory.status, m.inventory.resumeAfter, m.chunks.length, m.inventory.skippedFileBytes], ['running', 'data/f', 2, 0]);
+  assert.ok(!fs.readdirSync(path.join(mdir, 'chunks')).some((f) => f.endsWith('.partial')));
 
-  delete process.env.FAKE_DELAY_MS;
-  const before = calls().length;
-  const out2 = sink();
-  assert.equal(await migrateCommand({ ...base, migration: mdir, parallel: 2 }, out2), 0, out2.text());
+  s3.pages.length = 0;
+  s3.beforePage = null;
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, sourceBucket: undefined, migration: mdir }, out), 0, out.text());
+  assert.equal(s3.pages[0].StartAfter, 'data/f');
   m = readMigration(mdir);
-  assert.equal(m.outcome, 'success');
-  assert.deepEqual(m.chunks.map((c) => c.status), ['success', 'success', 'success']);
-  const after = calls().slice(before);
-  assert.equal(dryRunCalls(after).length, 0, 'the inventory is not listed again');
-  assert.equal(fs.statSync(path.join(mdir, 'inventory.jsonl')).mtimeMs, inventoryStat);
-  assert.equal(fs.statSync(path.join(mdir, 'chunks/00001.txt')).mtimeMs, chunkStat, 'the chunks are not cut again');
-  assert.deepEqual(after.filter((a) => a[0] === 'jobs').map((a) => a.slice(0, 3)), [['jobs', 'resume', 'job-2']], 'the interrupted job is resumed');
-  assert.ok(after.find((a) => a[0] === 'jobs')[3] === '--destination-sas');
-  assert.equal(listCalls(after).length, 2, 'the two pending chunks are new copies');
-  assert.equal(m.chunks[0].runs.length, 1, 'a resumed job stays in its run folder');
-  assert.match(out2.text(), /Copying 3 chunk\(s\), 2 at a time/);
+  assert.equal(m.inventory.status, 'done');
+  const paths = chunkPaths(mdir);
+  assert.deepEqual(paths, ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'], 'every key once, in order');
+  assert.deepEqual(readLines(path.join(mdir, 'chunks/skipped.jsonl')), [JSON.stringify({ path: 'g\nbad', size: 1, reason: 'line break in the key', storageClass: 'STANDARD', lastModified: '2026-01-15T00:00:00.000Z' })]);
+  assert.equal(container.blobs.size, 10);
+  assert.ok([...container.writeCount.values()].every((n) => n === 1));
 });
 
-test('migrate: --stop-after inventory and --stop-after chunk, then continue', async () => {
-  const { base, calls, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '6' });
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, stopAfter: 'inventory' }, out), 0);
-  const mdir = migrationDir();
-  assert.ok(fs.existsSync(path.join(mdir, 'inventory.jsonl')) && fs.existsSync(path.join(mdir, 'inventory-summary.json')));
-  assert.ok(!fs.existsSync(path.join(mdir, 'chunks')), 'nothing is chunked yet');
-  assert.equal(readMigration(mdir).outcome, 'stopped');
-  assert.match(out.text(), /6 objects/);
-  assert.match(out.text(), /Status: +Migration stopped/);
-  assert.equal(listCalls(calls()).length, 0);
-
-  // a continued migration keeps the chunking options it started with
-  assert.equal(await migrateCommand({ ...base, migration: mdir, chunkFiles: 3, stopAfter: 'chunk' }, sink()), 0);
-  let m = readMigration(mdir);
-  assert.equal(m.outcome, 'stopped');
-  assert.equal(m.chunking.status, 'done');
-  assert.equal(m.chunks.length, 3, 'chunk size 2 from the start of the migration');
-  assert.equal(listCalls(calls()).length, 0);
-  assert.equal(dryRunCalls(calls()).length, 1);
-
-  assert.equal(await migrateCommand({ ...base, migration: mdir }, sink()), 0);
-  m = readMigration(mdir);
-  assert.equal(m.outcome, 'success');
-  assert.equal(listCalls(calls()).length, 3);
-  assert.equal(dryRunCalls(calls()).length, 1, 'the inventory was listed once');
-
-  await assert.rejects(migrateCommand({ ...base, stopAfter: 'copy' }, sink()), /--stop-after/);
-});
-
-test('migrate: --dry-run creates nothing and prints the phases and commands, without secrets', async () => {
-  const { dir, base } = setup();
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, dryRun: true, chunkFiles: 5, parallel: 4, chunkBytes: '500GiB' }, out), 0);
-  assert.deepEqual(fs.readdirSync(dir), []);
-  const text = out.text();
-  assert.match(text, /Dry run - would run a migration \(nothing is created\)/);
-  assert.match(text, /1\. Inventory \(azcopy dry-run\).*\n.*--dry-run/);
-  assert.match(text, /Chunks of at most 5 objects or 500\.00 GiB/);
-  assert.match(text, /4 azcopy jobs at once.*\n.*--list-of-files .*00001\.txt/);
-  assert.ok(!text.includes('SECRETSIG123') && !text.includes(AWS_SECRET));
-  assert.match(text, /cont\/data\?\*\*\*/);
-});
-
-test('migrate: no SAS or AWS secret in migration.json, the logs, the chunk lists or the chunk runs', async () => {
-  const { dir, base } = setup({ FAKE_DRYRUN_COUNT: '6', FAKE_FAIL_LIST: 'd1/obj-00001.bin' });
-  const out = sink();
-  await migrateCommand({ ...base, chunkFiles: 3, maxAttempts: 2 }, out);
-  const files = fs.readdirSync(dir, { recursive: true, withFileTypes: true }).filter((e) => e.isFile() && !/^args\.jsonl/.test(e.name));
-  assert.ok(files.length > 10);
-  for (const f of files) {
-    const text = fs.readFileSync(path.join(f.parentPath, f.name), 'utf8');
-    for (const secret of ['SECRETSIG123', AWS_SECRET, 'sv=2022-11-02']) assert.ok(!text.includes(secret), `${secret} in ${f.name}`);
-  }
-  assert.ok(!out.text().includes('SECRETSIG123'));
-  assert.ok(files.some((f) => f.name === 'migration.json') && files.some((f) => /^failed-.*\.jsonl$/.test(f.name)));
-});
-
-test('migrate with --inventory-source s3: the SDK listing feeds the same chunks; keys with a line break are skipped', async () => {
-  const keys = [
-    ['data/a.txt', 10, '2026-01-01T00:00:00Z', 'STANDARD'],
-    ['data/bad\nkey.txt', 20, '2026-01-01T00:00:00Z', 'STANDARD'],
-    ['data/x y.txt', 30, '2026-01-01T00:00:00Z', 'GLACIER'],
-  ];
-  const { base, calls, migrationDir } = setup();
-  const fake = fakeS3(keys);
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, inventorySource: 's3', s3ListPage: fake.listPage, chunkFiles: 10 }, out), 0, out.text());
+test('migrate: Ctrl+C during the copy ends with 130; continuing copies the rest, each object once', async () => {
+  const { base, container, migrationDir } = setup(many(12), { pageSize: 100 });
+  container.delayMs = 20;
+  const ctrlC = new AbortController();
+  const stop = until(() => container.blobs.size >= 2).then(() => ctrlC.abort());
+  assert.equal(await migrateCommand({ ...base, chunkFiles: '4', parallel: '1', concurrency: '2', abortSignal: ctrlC.signal }, sink()), 130);
+  await stop;
   const mdir = migrationDir();
   const m = readMigration(mdir);
-  assert.equal(m.options.inventorySource, 's3');
-  assert.deepEqual([m.inventory.files, m.chunking.skipped, m.chunks.length], [3, 1, 1]);
-  assert.deepEqual(readLines(path.join(mdir, 'chunks/00001.txt')), ['a.txt', 'x y.txt']);
-  assert.equal(JSON.parse(readLines(path.join(mdir, 'chunks/skipped.jsonl'))[0]).path, 'bad\nkey.txt');
-  assert.equal(dryRunCalls(calls()).length, 0, 'azcopy did not list');
-  assert.match(out.text(), /Inventory \(S3 ListObjectsV2\)/);
-  assert.match(out.text(), /WARNING: 1 archived object\(s\)/);
-  assert.match(out.text(), /1 key\(s\) with a line break cannot be copied/);
-  assert.match(out.text(), /Not copied: +1 key\(s\) with a line break/);
-  assert.ok(JSON.parse(readLines(path.join(mdir, 'inventory.jsonl'))[0]).lastModified);
-
-  await assert.rejects(migrateCommand({ ...base, inventorySource: 'ftp' }, sink()), /--inventory-source/);
+  assert.ok(m.chunks.some((c) => c.status === 'interrupted'));
+  assert.ok(container.blobs.size < 12);
+  container.delayMs = 0;
+  assert.equal(await migrateCommand({ ...base, sourceBucket: undefined, migration: mdir }, sink()), 0);
+  assert.equal(container.blobs.size, 12);
+  assert.ok([...container.writeCount.values()].every((n) => n === 1));
+  assert.ok(readMigration(mdir).chunks.every((c) => c.status === 'success'));
 });
 
-test('migrate: a failed inventory ends the migration as failed, and continuing lists again', async () => {
-  const { base, migrationDir } = setup();
-  const failing = fakeS3([]);
-  failing.listPage = async () => { throw new Error('AccessDenied'); };
+test('migrate: a failed listing lets the closed chunks be copied, ends failed, and continuing lists again', async () => {
+  const { base, s3, container, migrationDir } = setup(many(6), { pageSize: 2 });
+  let failing = true;
+  s3.failPage = (n) => (failing && n === 2 ? Object.assign(new Error('Service Unavailable'), { name: 'ServiceUnavailable' }) : null);
   const out = sink();
-  assert.equal(await migrateCommand({ ...base, inventorySource: 's3', s3ListPage: failing.listPage }, out), 2);
+  assert.equal(await migrateCommand({ ...base, chunkFiles: '2' }, out), 2);
   const mdir = migrationDir();
-  assert.equal(readMigration(mdir).outcome, 'failed');
-  assert.equal(readMigration(mdir).inventory.status, 'pending');
-  assert.match(out.text(), /Inventory failed: S3 listing failed: AccessDenied/);
-  assert.ok(!fs.existsSync(path.join(mdir, 'inventory.jsonl')));
-  assert.equal(await migrateCommand({ ...base, migration: mdir, s3ListPage: fakeS3([['data/a', 1, '2026-01-01T00:00:00Z']]).listPage }, sink()), 0);
-  assert.equal(readMigration(mdir).outcome, 'success');
+  let m = readMigration(mdir);
+  assert.deepEqual([m.outcome, m.inventory.status, m.chunks.length], ['failed', 'failed', 2]);
+  assert.match(m.inventory.error, /ServiceUnavailable/);
+  assert.equal(container.blobs.size, 4, 'the closed chunks were copied');
+  assert.match(out.text(), /Listing failed/);
+  failing = false;
+  assert.equal(await migrateCommand({ ...base, sourceBucket: undefined, migration: mdir }, sink()), 0);
+  m = readMigration(mdir);
+  assert.deepEqual([m.outcome, m.inventory.status, m.chunks.length], ['success', 'done', 3]);
+  assert.equal(container.blobs.size, 6);
+});
+
+test('migrate: --stop-after inventory lists into chunks and copies nothing; continuing copies them', async () => {
+  const { base, container, migrationDir } = setup(many(3));
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, stopAfter: 'inventory' }, out), 0);
+  assert.equal(container.requests.length, 0);
+  const mdir = migrationDir();
+  assert.deepEqual([readMigration(mdir).outcome, readMigration(mdir).inventory.status], ['stopped', 'done']);
+  assert.match(out.text(), /3 objects, 30 B/);
+  await assert.rejects(migrateCommand({ ...base, stopAfter: 'chunk' }, sink()), /--stop-after/);
+  assert.equal(await migrateCommand({ ...base, sourceBucket: undefined, migration: mdir }, sink()), 0);
+  assert.equal(container.blobs.size, 3);
+});
+
+test('migrate: --dry-run creates nothing and prints the phases, without secrets', async () => {
+  const { dir, base, container } = setup(many(3));
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, dryRun: true }, out), 0);
+  assert.deepEqual(fs.readdirSync(dir), []);
+  assert.equal(container.requests.length, 0);
+  const text = out.text();
+  assert.match(text, /Dry run - would run a migration/);
+  assert.match(text, /chunks of at most 100,000 objects/);
+  assert.match(text, /4 chunk\(s\) at once, 32 object\(s\) at once in each/);
+  assert.ok(!text.includes('SECRETSIG123') && !text.includes(AWS_SECRET));
+});
+
+test('migrate: no SAS, AWS secret, session token or presigned signature in the migration folder or the output', async () => {
+  const { dir, base, container } = setup(many(4));
+  process.env.AWS_SESSION_TOKEN = SESSION_TOKEN;
+  // an error message that quotes secrets, as an SDK error can
+  container.fail = (name) => (name === 'data/f001.bin' ? Object.assign(httpError(403, 'AuthorizationFailure'), { message: `denied ${SAS} ${AWS_SECRET} ${SESSION_TOKEN} X-Amz-Signature=${PRESIGN_SECRET}` }) : null);
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, maxAttempts: '1' }, out), 1);
+  const texts = [out.text(), ...walk(dir).map((f) => fs.readFileSync(f, 'utf8'))];
+  for (const secret of ['SECRETSIG123', AWS_SECRET, SESSION_TOKEN, PRESIGN_SECRET]) {
+    assert.ok(!texts.some((t) => t.includes(secret)), `${secret} leaked`);
+  }
+  assert.ok(texts.some((t) => t.includes('AuthorizationFailure')), 'the error is still recorded');
+  delete process.env.AWS_SESSION_TOKEN;
+});
+
+/** A migration folder as the azcopy version (format 1) left it: one exhausted chunk per kind, and state.json pointing at it. */
+function formatOneMigration(dir) {
+  const mdir = path.join(dir, '20260101T000000Z-migration');
+  const run = path.join(mdir, 'chunks/00001/20260101T000500Z-chunk');
+  fs.mkdirSync(run, { recursive: true });
+  fs.writeFileSync(path.join(mdir, 'chunks/00001.txt'), 'f001.bin\nf002.bin\n');
+  fs.writeFileSync(path.join(mdir, 'chunks/00002.txt'), 'f003.bin\nf004.bin\n');
+  fs.writeFileSync(path.join(run, 'failed-20260101T000600Z.jsonl'), `${JSON.stringify({ relativePath: 'f002.bin', size: 10 })}\n`);
+  const m = {
+    kind: 'migration',
+    startedAt: '2026-01-01T00:00:00.000Z',
+    outcome: 'partial',
+    bucket: 'bkt',
+    prefix: 'data',
+    region: 'ap-southeast-2',
+    sourceBase: SOURCE_BASE,
+    targetBase: 'https://acct.blob.core.windows.net/cont',
+    destBase: DEST_BASE,
+    inventory: { status: 'done' },
+    chunking: { status: 'done' },
+    chunks: [
+      { id: 1, list: 'chunks/00001.txt', files: 2, bytes: 20, status: 'exhausted', lastOutcome: 'partial', runs: ['chunks/00001/20260101T000500Z-chunk'] },
+      { id: 2, list: 'chunks/00002.txt', files: 2, bytes: 20, status: 'exhausted', lastOutcome: 'failed', runs: [] },
+    ],
+  };
+  fs.writeFileSync(path.join(mdir, 'migration.json'), JSON.stringify(m));
+  saveState(path.join(dir, 'state.json'), stateKey(SOURCE_BASE, DEST_BASE), { startedAt: m.startedAt, runDir: mdir });
+  return mdir;
+}
+
+test('a format 1 migration (azcopy) is not continued, and works as the baseline of a delta with its carried files', async () => {
+  const { dir, base, container, migrationDir } = setup(many(4));
+  const old = formatOneMigration(dir);
+  await assert.rejects(migrateCommand({ ...base, sourceBucket: undefined, migration: old }, sink()), /earlier version .* cannot be continued/);
+  const carried = collectCarried(old);
+  assert.deepEqual([...carried.paths.entries()], [['f002.bin', 10], ['f003.bin', 10], ['f004.bin', 10]]);
+  assert.equal(listMigrations({ outputDir: dir })[0].format, 1);
+
+  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto' }, sink()), 0);
+  const delta = readMigration(migrationDir());
+  assert.deepEqual([delta.baseline.dir, delta.carried.files, delta.chunks[0].carried], [old, 3, true]);
+  assert.deepEqual([...container.blobs.keys()].sort(), ['data/f002.bin', 'data/f003.bin', 'data/f004.bin']); // nothing modified since, only the carried files
 });
 
 test('migrate: without --source-bucket the latest migration is shown and needs confirmation; --yes skips it', async () => {
-  const { dir, base } = setup({ FAKE_DRYRUN_COUNT: '2' });
-  const { sourceBucket, sourcePrefix, sourceRegion, ...target } = base;
-  await assert.rejects(migrateCommand(target, sink()), /No earlier migration/);
+  const { base, migrationDir } = setup(many(2));
   await migrateCommand({ ...base, stopAfter: 'inventory' }, sink());
-
+  const out = sink();
   const asked = [];
-  const out = sink();
-  await assert.rejects(migrateCommand({ ...target, confirm: async (q) => (asked.push(q), false) }, out), /Cancelled/);
-  assert.match(out.text(), /Latest migration: .*-migration\n {2}started .*, outcome stopped, 0\/0 chunk\(s\) done/);
-  assert.deepEqual(asked, ['Continue this migration? [y/N] ']);
-  assert.equal(readMigration(path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith('-migration')))).outcome, 'stopped');
-
-  assert.equal(await migrateCommand({ ...target, yes: true, confirm: async () => assert.fail('asked') }, sink()), 0);
-  // a SAS for another target is refused
-  await assert.rejects(migrateCommand({ ...target, yes: true, targetSasUrl: SAS.replace('/cont?', '/elsewhere?') }, sink()), /does not match/);
+  await assert.rejects(migrateCommand({ ...base, sourceBucket: undefined, yes: false, confirm: async (q) => (asked.push(q), false) }, out), /Cancelled/);
+  assert.equal(asked.length, 1);
+  assert.match(out.text(), new RegExp(`Latest migration: ${migrationDir().replace(/\\/g, '\\\\')}`));
+  assert.equal(await migrateCommand({ ...base, sourceBucket: undefined }, sink()), 0);
+  assert.equal(readMigration(migrationDir()).outcome, 'success');
 });
 
-test('listMigrations returns migrations newest first; run lists and `list` ignore them', async () => {
-  const { dir, base } = setup({ FAKE_DRYRUN_COUNT: '4' });
+test('listMigrations: newest first, with phase and mode; folders without a migration.json are left out', async () => {
+  const { dir, base } = setup(many(2));
   assert.deepEqual(listMigrations({ outputDir: path.join(dir, 'missing') }), []);
-  await migrateCommand({ ...base, chunkFiles: 2 }, sink());
-  await sleep(1100); // folder names have a one second resolution
-  await migrateCommand({ ...base, chunkFiles: 2, sourceRegion: undefined, stopAfter: 'chunk' }, sink());
-  fs.mkdirSync(path.join(dir, '20200101T000000Z-migration')); // no migration.json: ignored
-  const migrations = listMigrations({ outputDir: dir });
-  assert.equal(migrations.length, 2);
-  const [stopped, done] = migrations;
-  assert.deepEqual([done.outcome, done.phase, done.chunksDone, done.chunksTotal, done.region, done.bucket, done.prefix], ['success', 'done', 2, 2, 'ap-southeast-2', 'bkt', 'data']);
-  assert.deepEqual([stopped.outcome, stopped.phase, stopped.chunksDone, stopped.region], ['stopped', 'copying', 0, '']);
-  assert.equal(done.targetBase, 'https://acct.blob.core.windows.net/cont');
-  assert.deepEqual(listRuns({ outputDir: dir }), []);
+  await migrateCommand({ ...base, stopAfter: 'inventory' }, sink());
+  await migrateCommand({ ...base, lastCopyDate: '2026-01-01' }, sink());
+  fs.mkdirSync(path.join(dir, '20200101T000000Z-migration'));
+  const list = listMigrations({ outputDir: dir });
+  assert.deepEqual(list.map((l) => [l.mode, l.format, l.outcome, l.phase]), [['delta', 2, 'success', 'done'], ['full', 2, 'stopped', 'copying']]);
+  assert.deepEqual([list[1].bucket, list[1].prefix, list[1].region, list[1].chunksTotal], ['bkt', 'data', 'ap-southeast-2', 1]);
+});
 
+test('--repeat: deltas follow until one finds at most --repeat-until objects; usage errors', async () => {
+  const { base, migrationDirs } = setup(many(3));
   const out = sink();
-  assert.equal(await listCommand({ ...base, lastCopyDate: '2026-01-01' }, out, sink()), 0);
-  assert.match(out.text(), /^s3:\/\/bkt\/data\/d1\/obj-00001\.bin\t10\n/);
-});
-
-test('a chunk run is an ordinary run: retry --run and resume --run work on it', async () => {
-  const { base, migrationDir } = setup({ FAKE_DRYRUN_COUNT: '2', FAKE_FAIL_LIST: 'd1/obj-00001.bin' });
-  const { retryCommand } = await import('../src/commands.js');
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 5, maxAttempts: 1 }, sink()), 1);
-  const m = readMigration(migrationDir());
-  const run = path.join(migrationDir(), m.chunks[0].runs[0]);
-  delete process.env.FAKE_FAIL_LIST;
-  const out = sink();
-  assert.equal(await retryCommand({ ...base, run }, out), 0, out.text());
-  assert.match(out.text(), /Retrying 1 failed file\(s\)/);
-});
-
-
-// ------------------------------------------------------------- delta migrations
-
-test('chunking with carried paths: they come first, split by --chunk-files; one also in the inventory stays there', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-carried-'));
-  const file = writeRawInventory(dir, [{ path: 'a', size: 1 }, { path: 'c2', size: 5 }, { path: 'b', size: 1 }]);
-  const carried = new Map([['c1', 10], ['c2', 20], ['c3', 30], ['c4', 40]]);
-  const { chunks, carriedInInventory } = await createChunks({ inventoryFile: file, chunksDir: path.join(dir, 'chunks'), maxFiles: 2, maxBytes: 1000, carried });
-  assert.equal(carriedInInventory, 1);
-  assert.deepEqual(chunks.map((c) => [c.id, c.list, c.files, c.bytes, Boolean(c.carried)]), [
-    [1, 'chunks/00001.txt', 2, 40, true], [2, 'chunks/00002.txt', 1, 40, true], [3, 'chunks/00003.txt', 2, 6, false], [4, 'chunks/00004.txt', 1, 1, false],
-  ]);
-  assert.deepEqual(readLines(path.join(dir, 'chunks/00001.txt')), ['c1', 'c3']);
-  assert.deepEqual(readLines(path.join(dir, 'chunks/00003.txt')), ['a', 'c2']);
-  assert.deepEqual(fs.readdirSync(path.join(dir, 'chunks')).sort(), ['00001.txt', '00002.txt', '00003.txt', '00004.txt'], 'no temporary file left');
-});
-
-test('delta migration: --last-copy-date auto after a full migration; date, folder, baseline, lists and state.json', async () => {
-  const { dir, base, calls } = setup({ FAKE_DRYRUN_COUNT: '4' });
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2 }, sink()), 0);
-  const [full] = migrationDirs(dir);
-  const fullM = readMigration(full);
-
-  // the dry run shows the date and the baseline and creates nothing
-  const names = fs.readdirSync(dir);
-  const dry = sink();
-  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto', dryRun: true }, dry), 0);
-  assert.deepEqual(fs.readdirSync(dir), names);
-  assert.match(dry.text(), new RegExp(`Mode: +delta \\(objects modified on/after ${deltaDate(fullM)}\\)`));
-  assert.match(dry.text(), /Delta: +objects modified on\/after .* \(start of .*-migration, minus 10 min\)/);
-  assert.match(dry.text(), /Folder: +.*-delta-migration/);
-
-  const before = calls().length;
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, lastCopyDate: 'auto' }, out), 0, out.text());
-  const delta = migrationDirs(dir)[1];
-  assert.match(path.basename(delta), /^\d{8}T\d{6}Z-delta-migration$/);
-  const m = readMigration(delta);
-  assert.equal(m.includeAfter, deltaDate(fullM));
-  assert.deepEqual(m.baseline, { startedAt: fullM.startedAt, dir: full });
-  assert.equal(m.carried, null, 'the full migration copied everything');
-  const after = calls().slice(before);
-  const inventory = dryRunCalls(after);
-  assert.equal(inventory.length, 1);
-  assert.equal(inventory[0][inventory[0].indexOf('--include-after') + 1], m.includeAfter);
-  assert.ok(listCalls(after).length === 2 && listCalls(after).every((a) => !a.includes('--include-after')), 'the chunk lists name the files');
-  assert.deepEqual(Object.values(readState(path.join(dir, 'state.json'))).map((s) => [s.startedAt, s.runDir]), [[m.startedAt, delta]]);
-  assert.match(out.text(), /Delta: +objects modified on\/after .* \(start of .*-migration, minus 10 min\)/);
-  assert.match(out.text(), /Inventory \(azcopy dry-run\) of .*, modified on\/after /);
-  assert.match(out.text(), /Status: +Migration completed\nDelta: +objects modified/);
-
-  const listed = listMigrations({ outputDir: dir });
-  assert.deepEqual(listed.map((x) => [x.mode, x.includeAfter]), [['delta', m.includeAfter], ['full', null]]);
-});
-
-test('delta migration: the failed files of a partial baseline are carried into the first chunk; a typed date carries nothing', async () => {
-  // The full migration: chunks [obj-00001, obj-00002] and [obj-00003, obj-00004]; obj-00002 and obj-00004 fail.
-  const { dir, base } = setup({ FAKE_DRYRUN_COUNTS: '4,2', FAKE_FAIL_LIST: 'd1/obj-00004.bin,d2/obj-00002.bin' });
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, maxAttempts: 1 }, sink()), 1);
-  const [full] = migrationDirs(dir);
-  delete process.env.FAKE_FAIL_LIST;
-
-  // The delta lists obj-00001 and obj-00002 (modified since): obj-00002 is copied with the inventory, obj-00004 is carried.
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, lastCopyDate: 'auto' }, out), 0, out.text());
-  const delta = migrationDirs(dir)[1];
-  const m = readMigration(delta);
-  assert.deepEqual(m.carried, { files: 2, bytes: 20, fromChunks: [1, 2], chunks: 1, inInventory: 1 });
-  assert.deepEqual(m.chunks.map((c) => [c.id, c.files, Boolean(c.carried), c.status]), [[1, 1, true, 'success'], [2, 2, false, 'success']]);
-  assert.deepEqual(readLines(path.join(delta, 'chunks/00001.txt')), ['d1/obj-00004.bin']);
-  assert.deepEqual(readLines(path.join(delta, 'chunks/00002.txt')), ['d1/obj-00001.bin', 'd2/obj-00002.bin']);
-  assert.match(out.text(), /Carried: +2 file\(s\) that .*-migration did not copy \(2 chunk\(s\)\), 20 B, in the first chunk\(s\)/);
-  assert.match(out.text(), /Chunks: 2 \(1 carried over \+ 1 from the inventory\)/);
-  assert.match(out.text(), /Carried: +2 file\(s\) .* in 1 chunk\(s\), 1 of them modified since/);
-  const baseline = readMigration(full);
-  assert.deepEqual([baseline.outcome, ...baseline.chunks.map((c) => c.status)], ['partial', 'exhausted', 'exhausted'], 'the baseline is left as it was');
-
-  // a typed date has no baseline
-  process.env.FAKE_DRYRUN_COUNTS = '2';
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, lastCopyDate: '2026-01-01' }, sink()), 0);
-  const typed = readMigration(migrationDirs(dir)[2]);
-  assert.deepEqual([typed.includeAfter, typed.baseline, typed.carried, typed.chunks.length], ['2026-01-01T00:00:00Z', null, null, 1]);
-});
-
-test('delta migration: a baseline chunk whose job failed is carried as its whole list; an inventory with nothing modified is fine', async () => {
-  const { dir, base } = setup({ FAKE_DRYRUN_COUNTS: '4,0' });
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, stopAfter: 'chunk' }, sink()), 0);
-  const [full] = migrationDirs(dir);
-  // as if the job of chunk 1 failed on every attempt
-  const fullM = readMigration(full);
-  Object.assign(fullM.chunks[0], { status: 'exhausted', lastOutcome: 'failed', attempts: 5 });
-  Object.assign(fullM.chunks[1], { status: 'success' });
-  fullM.outcome = 'partial';
-  fs.writeFileSync(path.join(full, 'migration.json'), JSON.stringify(fullM));
-
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 5, baselineDir: full }, out), 0, out.text());
-  const m = readMigration(migrationDirs(dir)[1]);
-  assert.equal(m.includeAfter, deltaDate(fullM));
-  assert.deepEqual(m.carried, { files: 2, bytes: 30, fromChunks: [1], chunks: 1, inInventory: 0 });
-  assert.equal(m.inventory.files, 0);
-  assert.deepEqual(m.chunks.map((c) => [c.files, c.bytes, c.carried, c.status]), [[2, 30, true, 'success']]);
-  assert.deepEqual(readLines(path.join(migrationDirs(dir)[1], 'chunks/00001.txt')), ['d1/obj-00001.bin', 'd2/obj-00002.bin']);
-});
-
-test('delta migration: nothing modified and nothing carried ends at once as success, and the baseline moves forward', async () => {
-  const { dir, base, calls } = setup({ FAKE_DRYRUN_COUNTS: '4,0' });
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2 }, sink()), 0);
-  const copies = listCalls(calls()).length;
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto' }, out), 0, out.text());
-  const delta = migrationDirs(dir)[1];
-  const m = readMigration(delta);
-  assert.deepEqual([m.outcome, m.chunking.status, m.chunks.length], ['success', 'done', 0]);
-  assert.equal(listCalls(calls()).length, copies, 'no copy job');
-  assert.match(out.text(), /Nothing was modified on\/after .* and nothing is carried over: no chunk to copy\./);
-  assert.match(out.text(), /Status: +Migration completed\n[^]*Chunks: +0 copied/);
-  assert.ok(!out.text().includes('Copying'));
-  assert.equal(Object.values(readState(path.join(dir, 'state.json')))[0].runDir, delta);
-});
-
-test('state.json only moves forward: an older migration continued after a newer delta keeps the delta as the baseline', async () => {
-  const { dir, base } = setup({ FAKE_DRYRUN_COUNTS: '4,1', FAKE_FAIL_LIST: 'd1/obj-00004.bin' });
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, maxAttempts: 1 }, sink()), 1);
-  const [full] = migrationDirs(dir);
-  process.env.FAKE_FAIL_LIST = 'd1/obj-00004.bin'; // the carried file still fails in the delta
-  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto', maxAttempts: 1 }, sink()), 1);
-  const delta = migrationDirs(dir)[1];
-  delete process.env.FAKE_FAIL_LIST;
-  assert.equal(await migrateCommand({ ...base, migration: full }, sink()), 0);
-  assert.equal(readMigration(full).outcome, 'success');
-  assert.equal(Object.values(readState(path.join(dir, 'state.json')))[0].runDir, delta);
-  const log = fs.readdirSync(full).filter((f) => f.endsWith('.log')).map((f) => fs.readFileSync(path.join(full, f), 'utf8')).join('');
-  assert.match(log, /state\.json kept: a later run is recorded/);
-});
-
-test('delta migration with --inventory-source s3 and auto: the listing keeps the keys modified since the baseline', async () => {
-  const { dir, base } = setup();
-  const s3 = (extra = {}) => migrateCommand({ ...base, inventorySource: 's3', s3ListPage: fakeS3(S3_KEYS).listPage, chunkFiles: 10, ...extra }, sink());
-  assert.equal(await s3(), 0);
-  const file = path.join(dir, 'state.json');
-  const [[key, entry]] = Object.entries(readState(file));
-  fs.writeFileSync(file, JSON.stringify({ [key]: { ...entry, startedAt: '2026-02-01T00:10:00.000Z' } }));
-  assert.equal(await s3({ lastCopyDate: 'auto' }), 0);
-  const delta = migrationDirs(dir).find((d) => d.endsWith('-delta-migration'));
-  assert.equal(readMigration(delta).includeAfter, '2026-02-01T00:00:00Z');
-  assert.deepEqual(readLines(path.join(delta, 'inventory.jsonl')).map((l) => JSON.parse(l).path), ['sub/b c.txt', 'new.txt']);
-});
-
-// ------------------------------------------------------------- --repeat
-
-test('--repeat: deltas follow until one finds at most --repeat-until objects; each is based on the one before', async () => {
-  const { dir, base, calls } = setup({ FAKE_DRYRUN_COUNTS: '25,12,5' });
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 10, repeat: true, repeatUntil: '5' }, out), 0, out.text());
-  const dirs = migrationDirs(dir);
-  assert.equal(dirs.length, 3);
-  const [full, d1, d2] = dirs.map(readMigration);
-  assert.equal(full.includeAfter, null);
-  assert.deepEqual([d1.baseline.dir, d1.includeAfter, d1.inventory.files], [dirs[0], deltaDate(full), 12]);
-  assert.deepEqual([d2.baseline.dir, d2.includeAfter, d2.inventory.files], [dirs[1], deltaDate(d1), 5]);
-  assert.deepEqual([d1.options.chunkFiles, d2.prefix, d2.region], [10, 'data', 'ap-southeast-2'], 'the settings of the round before');
-  assert.deepEqual(dryRunCalls(calls()).map((a) => a.includes('--include-after')), [false, true, true]);
-  const text = out.text();
-  assert.match(text, /Round 0: the migration, then deltas until one finds ≤ 5 objects/);
-  assert.match(text, /Round 2: delta 2 of at most 10/);
-  assert.match(text, /Repeat summary[^]*\nfull +\S+-migration +25 +25 +success\n1 +\S+-delta-migration +12 +12 +success\n2 +\S+-delta-migration +5 +5 +success\n/);
-  assert.match(text, /Caught up: the last delta found 5 objects \(≤ 5\)\. Stop the writers and run one more delta for cutover:\n {2}azcopy-commander migrate --source-bucket bkt --source-prefix data --source-region ap-southeast-2 --last-copy-date auto/);
-});
-
-test('--repeat: stops at --repeat-max; the failed files of a partial round are carried into the next one', async () => {
-  // obj-00004 fails once (the full migration ends partial); every delta lists obj-00001 and obj-00002
-  const { dir, base } = setup({ FAKE_DRYRUN_COUNTS: '4,2', FAKE_FAIL_LIST: 'd1/obj-00004.bin:1' });
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, chunkFiles: 2, maxAttempts: 1, repeat: true, repeatUntil: 1, repeatMax: '2' }, out), 0, out.text());
-  const dirs = migrationDirs(dir);
-  assert.equal(dirs.length, 3, 'the migration and two deltas');
-  const d1 = readMigration(dirs[1]);
-  assert.deepEqual(d1.chunks.map((c) => [Boolean(c.carried), c.status]), [[true, 'success'], [false, 'success']]);
-  assert.deepEqual(readLines(path.join(dirs[1], 'chunks/00001.txt')), ['d1/obj-00004.bin']);
-  assert.equal(readMigration(dirs[2]).carried, null);
-  assert.match(out.text(), /full +\S+ +4 +3 +partial\n1 +\S+ +2 +3 +success\n2 +\S+ +2 +2 +success/);
-  assert.match(out.text(), /Not caught up after 2 delta\(s\): the last one found 2 objects \(more than 1\)\.\nThe source is still changing faster/);
-});
-
-test('--repeat: an interrupted round stops the loop with 130 and says how to continue', async () => {
-  const { dir, base, events } = setup({ FAKE_DRYRUN_COUNTS: '2', FAKE_DELAY_MS: '1500' });
-  const abort = new AbortController();
-  const out = sink();
-  const running = migrateCommand({ ...base, repeat: true, abortSignal: abort.signal }, out);
-  while (events().filter(([n]) => n === 'start').length < 2) await sleep(20); // the copy job of the first delta has started
-  abort.abort();
-  assert.equal(await running, 130, out.text());
-  const dirs = migrationDirs(dir);
+  assert.equal(await migrateCommand({ ...base, repeat: true, repeatUntil: '0' }, out), 0);
+  const dirs = migrationDirs();
   assert.equal(dirs.length, 2);
-  assert.equal(readMigration(dirs[1]).outcome, 'interrupted');
-  assert.match(out.text(), /\n1 +\S+-delta-migration +2 +0 +interrupted\n/);
-  assert.match(out.text(), /Interrupted in round 1\. Continue it, and the deltas after it, with:\n {2}azcopy-commander migrate --migration ".*-delta-migration" --repeat\n/);
-});
-
-test('--repeat: usage errors, and a dry run says that deltas would follow', async () => {
-  const { dir, base } = setup();
-  await assert.rejects(migrateCommand({ ...base, repeat: true, stopAfter: 'chunk' }, sink()), /--repeat cannot be used with --stop-after/);
+  assert.equal(readMigration(dirs[1]).baseline.dir, dirs[0]);
+  assert.match(out.text(), /Caught up: the last delta found 0 objects/);
   await assert.rejects(migrateCommand({ ...base, repeatUntil: '5' }, sink()), /--repeat-until needs --repeat/);
-  await assert.rejects(migrateCommand({ ...base, repeat: true, repeatUntil: '-1' }, sink()), /--repeat-until/);
-  await assert.rejects(migrateCommand({ ...base, repeat: true, repeatMax: '0' }, sink()), /--repeat-max/);
-  const out = sink();
-  assert.equal(await migrateCommand({ ...base, repeat: true, repeatUntil: '0', dryRun: true }, out), 0);
-  assert.deepEqual(fs.readdirSync(dir), []);
-  assert.match(out.text(), /Then: +delta migrations one after another, until one finds at most 0 objects \(at most 10 deltas\)/);
+  await assert.rejects(migrateCommand({ ...base, repeat: true, stopAfter: 'inventory' }, sink()), /--repeat cannot be used with --stop-after/);
+  const dry = sink();
+  assert.equal(await migrateCommand({ ...base, repeat: true, dryRun: true }, dry), 0);
+  assert.match(dry.text(), /Then: {4}delta migrations one after another/);
 });

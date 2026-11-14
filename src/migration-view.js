@@ -10,17 +10,17 @@ const num = (v) => Number(v) || 0;
 export const isFinished = (chunk) => chunk.status === 'success' || chunk.status === 'exhausted';
 
 /**
- * Adds up what the chunks of a migration have done, against the inventory total (known from the start, so
- * the percentage and the ETA are meaningful from the first chunk on).
+ * Adds up what the chunks of a migration have done, against the total of the chunks so far. While the listing runs
+ * (`listing` set, with the objects listed so far) the total grows: it is shown with a `+`, and there is no ETA.
  *
- * `chunks` are the entries of migration.json (the orchestrator keeps them up to date: status, bytes of the
- * chunk, and `copied` / `ignored` / `failed` / `bytesCopied` summed over the attempts that ended). The running
- * jobs report through `update(id, snapshot)` (a Metrics snapshot) and are folded in on top.
+ * `chunks` are the entries of migration.json, the array the orchestrator adds the closed chunks to (status, bytes of
+ * the chunk, and `copied` / `ignored` / `missing` / `failed` / `bytesCopied` summed over the attempts that ended).
+ * The running chunks report through `update(id, snapshot)` (see copyChunk) and are folded in on top.
  */
 export class MigrationProgress {
-  constructor({ chunks, totalBytes, now = Date.now }) {
+  constructor({ chunks, now = Date.now }) {
     this.chunks = chunks;
-    this.totalBytes = totalBytes;
+    this.listing = null; // { files } while the listing runs
     this.now = now;
     this.startedAt = now();
     this.live = new Map(); // chunk id -> latest job snapshot
@@ -39,7 +39,9 @@ export class MigrationProgress {
   snapshot(now = this.now()) {
     let copied = 0;
     let ignored = 0;
+    let missing = 0;
     let failed = 0;
+    let total = 0;
     let bytesDone = 0;
     let done = 0;
     const running = [];
@@ -47,6 +49,8 @@ export class MigrationProgress {
       const live = this.live.get(c.id);
       copied += num(c.copied) + num(live?.copied);
       ignored += num(c.ignored) + num(live?.ignored);
+      missing += num(c.missing) + num(live?.missing);
+      total += num(c.bytes);
       failed += live ? num(live.failed) : num(c.failed);
       if (c.status === 'success') bytesDone += c.bytes;
       else if (live) {
@@ -62,8 +66,10 @@ export class MigrationProgress {
     const [t0, b0] = this.samples[0];
     const [t1, b1] = this.samples.at(-1);
     const throughput = t1 > t0 ? Math.max(0, ((b1 - b0) / (t1 - t0)) * 1000) : 0;
-    const total = this.totalBytes;
+    const listing = Boolean(this.listing);
     return {
+      listing,
+      listed: num(this.listing?.files),
       chunksTotal: this.chunks.length,
       chunksDone: done,
       chunksRunning: running.length,
@@ -72,12 +78,13 @@ export class MigrationProgress {
       running,
       copied,
       ignored,
+      missing,
       failed,
       bytesDone,
       bytesTotal: total,
       percent: total > 0 ? Math.min(100, (bytesDone / total) * 100) : 0,
       throughput,
-      etaSeconds: throughput > 0 ? Math.max(0, total - bytesDone) / throughput : NaN,
+      etaSeconds: !listing && throughput > 0 ? Math.max(0, total - bytesDone) / throughput : NaN,
       elapsedSeconds: (now - this.startedAt) / 1000,
     };
   }
@@ -86,19 +93,22 @@ export class MigrationProgress {
 /** The aggregate progress line (plain output and migration log). */
 export function formatAggregate(s) {
   return [
-    'COPYING',
+    s.listing ? 'LISTING+COPYING' : 'COPYING',
+    ...(s.listing ? [`listed ${formatCount(s.listed)} (${formatCount(s.chunksTotal)} chunks)`] : []),
     `chunks ${formatCount(s.chunksDone)}/${formatCount(s.chunksTotal)} done, ${formatCount(s.chunksRunning)} running`,
     `copied ${formatCount(s.copied)}`,
+    `ignored ${formatCount(s.ignored)}`,
+    ...(s.missing > 0 ? [`missing ${formatCount(s.missing)}`] : []),
     `failed ${formatCount(s.failed)}`,
-    `${formatBytes(s.bytesDone)} / ${formatBytes(s.bytesTotal)} (${s.percent.toFixed(1)}%)`,
+    s.listing ? `${formatBytes(s.bytesDone)} / ${formatBytes(s.bytesTotal)}+` : `${formatBytes(s.bytesDone)} / ${formatBytes(s.bytesTotal)} (${s.percent.toFixed(1)}%)`,
     `${formatBytes(s.throughput)}/s`,
-    `ETA ${formatDuration(s.etaSeconds)}`,
+    s.listing ? 'ETA after listing' : `ETA ${formatDuration(s.etaSeconds)}`,
   ].join(' | ');
 }
 
 /** The line that says how a chunk ended. */
 export function chunkEndLine(c) {
-  return `chunk ${chunkId(c.id)} ${c.status}   copied ${formatCount(c.copied)}  ignored ${formatCount(c.ignored)}  failed ${formatCount(c.failed)}   ${formatBytes(c.bytesCopied)}  ${formatDuration(c.seconds ?? 0)}`;
+  return `chunk ${chunkId(c.id)} ${c.status}   copied ${formatCount(c.copied)}  ignored ${formatCount(c.ignored)}  ${num(c.missing) > 0 ? `missing ${formatCount(c.missing)}  ` : ''}failed ${formatCount(c.failed)}   ${formatBytes(c.bytesCopied)}  ${formatDuration(c.seconds ?? 0)}`;
 }
 
 const TITLES = { success: 'Migration completed', partial: 'Migration completed with failed files', failed: 'Migration failed', interrupted: 'Migration interrupted', stopped: 'Migration stopped' };
@@ -114,7 +124,7 @@ export function deltaLines(m) {
   const lines = [['Delta', `objects modified on/after ${m.includeAfter}${from}`]];
   const c = m.carried;
   if (c) {
-    const where = c.chunks === undefined ? 'in the first chunk(s)' : `in ${formatCount(c.chunks)} chunk(s)${c.inInventory ? `, ${formatCount(c.inInventory)} of them modified since and copied with the inventory` : ''}`;
+    const where = c.chunks === undefined ? 'in the first chunk(s)' : `in ${formatCount(c.chunks)} chunk(s)${c.inListing ? `, ${formatCount(c.inListing)} of them modified since (copied from their carried chunk)` : ''}`;
     lines.push(['Carried', `${formatCount(c.files)} file(s) that ${m.baseline.dir} did not copy (${formatCount(c.fromChunks.length)} chunk(s)), ${formatBytes(c.bytes)}, ${where}`]);
   }
   return lines;
@@ -130,12 +140,17 @@ export function migrationSummaryLines(result, hints = {}) {
     `Chunks:           ${formatCount(result.chunksSuccess)} copied, ${formatCount(result.chunksExhausted)} with failed files after ${formatCount(result.maxAttempts)} attempt(s), ${formatCount(result.chunksOpen)} not finished (of ${formatCount(result.chunksTotal)})`,
     `Files copied:     ${formatCount(result.copied)}`,
     `Files failed:     ${formatCount(result.failed)}`,
-    `Files ignored:    ${formatCount(result.ignored)}  (skipped by azcopy, e.g. already at the target)`,
+    `Files ignored:    ${formatCount(result.ignored)}  (already at the target)`,
+    ...(result.missing > 0 ? [`Files missing:    ${formatCount(result.missing)}  (deleted from the source after the listing)`] : []),
     `Data copied:      ${formatBytes(result.bytesCopied)}`,
     `Elapsed:          ${formatDuration(result.elapsedSeconds)}`,
     `Migration folder: ${result.dir}`,
   ];
-  if (result.skipped > 0) lines.push(`Not copied:       ${formatCount(result.skipped)} key(s) with a line break, listed in ${result.skippedFile}`);
+  if (result.skipped > 0) {
+    const archived = num(result.archived);
+    const kinds = [archived > 0 ? `${formatCount(archived)} archived (not restored)` : '', result.skipped > archived ? `${formatCount(result.skipped - archived)} with a line break` : ''].filter(Boolean).join(', ');
+    lines.push(`Not copied:       ${formatCount(result.skipped)} key(s) (${kinds}), listed in ${result.skippedFile}`);
+  }
   if (result.failed > 0 || result.chunksExhausted > 0) lines.push('Failed files:     see the failed-*.jsonl in the chunk folders; `migrate --migration` tries them again');
   if (result.outcome === 'interrupted' || result.outcome === 'stopped' || result.chunksOpen > 0) lines.push(`Continue:         ${hints.continue}`);
   return lines;
@@ -147,9 +162,10 @@ export function migrationSummaryLines(result, hints = {}) {
  * `close` last.
  *
  *   start({ dir, logFile, migration })         `migration` is the migration.json record
- *   inventoryStarted({ provider, source, includeAfter })   inventoryProgress({ files, bytes })
- *   analysis(summary, lines)                   chunking({ chunks, skipped, maxFiles, maxBytes, chunksDir })
- *   copyStarted({ chunks, total, parallel })   chunkStarted(id)   chunkEnded(chunkEntry)
+ *   inventoryStarted({ provider, source, includeAfter, resumeAfter })   inventoryProgress({ files, bytes, chunks })
+ *   copyStarted({ chunks, parallel, concurrency })   `chunks`: the closed chunks left to copy when copying starts
+ *   chunking({ chunks, skipped, archived, maxFiles, maxBytes, chunksDir })   the listing ended (`chunks`: all of them)
+ *   chunkClosed(chunkEntry)   analysis(summary, lines)   chunkStarted(id)   chunkEnded(chunkEntry)
  *   progress(aggregateSnapshot, { periodic })  failure(id, path, code)
  *   message(level, text)   log(level, text)    summary(result, hints)   close()
  */
@@ -159,27 +175,29 @@ export class PlainMigrationView extends PlainView {
     for (const [label, text] of migration ? deltaLines(migration) : []) this.print(`${`${label}:`.padEnd(11)}${text}`);
   }
 
-  inventoryStarted({ provider, source, includeAfter }) {
-    this.print(`Inventory (${provider}) of ${source}${includeAfter ? `, modified on/after ${includeAfter}` : ''} ...`);
+  inventoryStarted({ provider, source, includeAfter, resumeAfter }) {
+    this.print(`Inventory (${provider}) of ${source}${includeAfter ? `, modified on/after ${includeAfter}` : ''}${resumeAfter ? ', continued after the last closed chunk' : ''} ...`);
   }
 
-  inventoryProgress({ files, bytes }) {
-    this.status(`inventory | ${formatCount(files)} objects | ${formatBytes(bytes)}`);
-  }
+  inventoryProgress() {} // the aggregate progress line has the listing count
 
   analysis(summary, lines) {
     lines.forEach((l) => this.print(`  ${l}`));
   }
 
-  chunking({ chunks, skipped, maxFiles, maxBytes, chunksDir }) {
+  chunking({ chunks, skipped, archived = 0, maxFiles, maxBytes, chunksDir }) {
     const carried = chunks.filter((c) => c.carried).length;
     const split = carried > 0 ? ` (${formatCount(carried)} carried over + ${formatCount(chunks.length - carried)} from the inventory)` : '';
-    this.print(`Chunks: ${formatCount(chunks.length)}${split} (≤ ${formatCount(maxFiles)} objects or ≤ ${formatBytes(maxBytes)} each) in ${chunksDir}`);
-    if (skipped > 0) this.print(`  ${formatCount(skipped)} key(s) with a line break cannot be copied; they are listed in skipped.jsonl`);
+    this.print(`Listing done. Chunks: ${formatCount(chunks.length)}${split} (≤ ${formatCount(maxFiles)} objects or ≤ ${formatBytes(maxBytes)} each) in ${chunksDir}`);
+    if (skipped > 0) this.print(`  ${formatCount(skipped)} key(s) cannot be copied (${formatCount(archived)} archived, ${formatCount(skipped - archived)} with a line break); they are listed in skipped.jsonl`);
   }
 
-  copyStarted({ chunks, total, parallel }) {
-    this.print(`Copying ${formatCount(chunks)} chunk(s)${chunks < total ? ` (of ${formatCount(total)})` : ''}, ${parallel} at a time`);
+  copyStarted({ chunks, parallel, concurrency }) {
+    this.print(`Copying as the chunks close${chunks > 0 ? ` (${formatCount(chunks)} ready)` : ''}: ${parallel} chunk(s) at a time, ${concurrency} object(s) at once in each`);
+  }
+
+  chunkClosed(chunk) {
+    this.print(`  chunk ${chunkId(chunk.id)} listed: ${formatCount(chunk.files)} objects, ${formatBytes(chunk.bytes)}`);
   }
 
   chunkStarted(id) {
@@ -204,8 +222,8 @@ export class PlainMigrationView extends PlainView {
 }
 
 /**
- * The `view` one chunk's job gets (see view.js): it forwards what the job reports to the one migration
- * view, so N jobs never write status lines over each other.
+ * What one chunk's copy reports goes to the one migration view through this, so N chunks never write status lines
+ * over each other.
  *   progress   the aggregator and `changed()`, which shows the new aggregate
  */
 export class ChunkView {
@@ -215,10 +233,6 @@ export class ChunkView {
     this.view = view;
     this.changed = changed;
   }
-
-  start() {}
-
-  jobStarted() {}
 
   progress(snapshot, opts) {
     this.progress_.update(this.id, snapshot);
@@ -236,8 +250,4 @@ export class ChunkView {
   log(level, text) {
     this.view.log(level, `chunk ${chunkId(this.id)}: ${text}`);
   }
-
-  summary() {}
-
-  close() {}
 }

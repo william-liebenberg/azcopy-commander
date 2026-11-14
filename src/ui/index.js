@@ -1,5 +1,5 @@
 import process from 'node:process';
-import { EXIT } from '../job.js';
+import { EXIT } from '../errors.js';
 import { withCoalescedOutput } from './output.js';
 import { runWizard } from './wizard.js';
 

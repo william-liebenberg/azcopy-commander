@@ -8,7 +8,7 @@ const AWS_VARS = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOK
  * put into an argument list or printed: `describe()` says where each value came from, never what it is.
  *
  *   - AWS keys: `useEnvironmentAws()` leaves the environment alone; `setAws()` holds typed values that
- *     `apply()` puts into the environment of this process (azcopy and the commands read them there)
+ *     `apply()` puts into the environment of this process (the S3 client of the commands reads them there)
  *     until `restore()` puts the previous values back.
  *   - SAS URL: held here and passed to the commands as `opts.targetSasUrl`.
  */

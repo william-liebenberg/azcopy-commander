@@ -1,7 +1,7 @@
 {
   "name": "azcopy-commander",
-  "version": "1.0.0",
-  "description": "Node.js controller for AzCopy: large-volume, append-only (delta) S3 to Azure Blob migration with live progress, timestamped logs and retryable failure lists.",
+  "version": "2.0.0",
+  "description": "Large-volume, append-only (delta) S3 to Azure Blob migration with the Azure SDK: server-side copies from presigned S3 URLs, started while the source is still being listed, with live progress, timestamped logs and retryable failure lists.",
   "type": "module",
   "bin": {
     "azcopy-commander": "bin/azcopy-commander.js"
@@ -15,6 +15,8 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1168.0",
+    "@aws-sdk/s3-request-presigner": "^3.1168.0",
+    "@azure/storage-blob": "^12.34.0",
     "@clack/prompts": "^1.8.1"
   },
   "license": "MIT",

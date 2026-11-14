@@ -1,40 +1,10 @@
-import { formatSnapshot } from './metrics.js';
-import { formatBytes, formatCount, formatDuration } from './format.js';
-
 /**
- * The lines of the final "Copy summary", derived from a job report. They go to the copy log and to
- * the plain view, so the file and the console say the same thing.
- */
-export function summaryLines(report, hints = {}) {
-  const lines = [
-    '',
-    '================ Copy summary ================',
-    `Status:           ${report.jobStatus}${report.outcome === 'failed' && report.lastError ? ` (${report.lastError})` : ''}`,
-    `Files discovered: ${formatCount(report.discovered)}`,
-    `Files copied:     ${formatCount(report.copied)}`,
-    `Files failed:     ${formatCount(report.failed)}`,
-    `Files ignored:    ${formatCount(report.ignored)}  (skipped by azcopy, e.g. already at the target)`,
-    `Data copied:      ${formatBytes(report.bytesCopied)} of ${formatBytes(report.bytesExpected)}`,
-    `Elapsed:          ${formatDuration(report.elapsedSeconds)}`,
-    `Copy log:         ${report.files.log}`,
-  ];
-  if (report.files.failed) lines.push(`Failed list:      ${report.files.failed}`, `Retry failures:   ${hints.retry}`);
-  if (report.jobId && (report.outcome === 'interrupted' || report.outcome === 'failed')) lines.push(`Resume:           ${hints.resume}`);
-  return lines;
-}
-
-/**
- * What `runJob` shows while a job runs. `PlainView` is the output of the command line: lines for scripts
- * and logs, and on a terminal one status line redrawn in place. Another view (the wizard's dashboard)
- * implements the same methods:
+ * The output of the command line: lines for scripts and logs, and on a terminal one status line redrawn in place.
+ * PlainMigrationView (migration-view.js) builds on it; it implements the view methods a migration calls:
  *
- *   start({ logFile })        the job is about to start
- *   jobStarted(jobId)         azcopy reported its job id
- *   progress(snapshot, opts)  a Metrics snapshot; opts.periodic is true about every 30 s
  *   message(level, text)      a warning or error (already redacted)
- *   failure(relativePath, errorCode)  one more failed file
- *   log(level, text)          an azcopy message that is only logged (Info, stderr, ...); already redacted
- *   summary(report, hints)    the job is over
+ *   failure(...)              one more failed file (not printed: it is in the chunk's failed list)
+ *   log(level, text)          a line that is only logged; already redacted
  *   close()                   release timers / the cursor; always called, also after an error
  */
 export class PlainView {
@@ -56,31 +26,13 @@ export class PlainView {
     this.statusShown = true;
   }
 
-  start({ logFile }) {
-    this.print(`Copy log: ${logFile}`);
-  }
-
-  jobStarted(jobId) {
-    this.print(`Job ID: ${jobId}`);
-  }
-
-  progress(snapshot, { periodic = false } = {}) {
-    const line = formatSnapshot(snapshot);
-    this.status(line);
-    if (periodic && !this.out.isTTY) this.print(line); // no live line without a terminal: print one periodically instead
-  }
-
   message(level, text) {
     this.print(text);
   }
 
   failure() {}
 
-  log() {} // the plain output stays as it is: these lines are in the copy log
-
-  summary(report, hints) {
-    summaryLines(report, hints).forEach((l) => this.print(l));
-  }
+  log() {} // the plain output stays as it is: these lines are in the logs
 
   close() {}
 }

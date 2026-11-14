@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { writeFileAtomic } from './files.js';
 
 /*
  * state.json remembers when the last copy of each source->target pair started, so a later
@@ -20,7 +21,5 @@ export function readState(file) {
 export function saveState(file, key, entry) {
   const state = { ...readState(file), [key]: entry };
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`; // write + rename so a crash never leaves a half-written state file
-  fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  writeFileAtomic(file, `${JSON.stringify(state, null, 2)}\n`); // write + rename so a crash never leaves a half-written state file
 }
