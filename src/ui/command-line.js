@@ -18,6 +18,7 @@ const OPTIONS = [
   ['sourceRegion', 'string'],
   ['lastCopyDate', 'string'],
   ['overwriteModified', 'boolean'],
+  ['sizeProfile', 'string'],
   ['chunkFiles', 'string'],
   ['chunkBytes', 'string'],
   ['chunkMinutes', 'string'],
@@ -47,12 +48,13 @@ export function shellQuote(value, platform = process.platform) {
 }
 
 /**
- * `azcopy-commander migrate ...` for the options `opts` of migrateCommand. The folders are made absolute, so the
+ * `azcopy-commander migrate ...` for the options `opts` of migrateCommand. The folders and files are made absolute, so the
  * command works from any directory; the target SAS URL, the views and the other internal options are left out.
  */
 export function migrateCommandLine(opts, { platform = process.platform } = {}) {
   const values = { ...opts, outputDir: path.resolve(opts.outputDir ?? 'runs') };
   if (values.migration) values.migration = path.resolve(values.migration);
+  if (values.sizeProfile) values.sizeProfile = path.resolve(values.sizeProfile);
   const args = [CLI, 'migrate'];
   for (const [key, type] of OPTIONS) {
     const value = values[key];

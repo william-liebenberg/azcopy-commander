@@ -62,15 +62,19 @@ function renderResult(state, { columns, st, sym }) {
   return lines;
 }
 
-/** The cells of the running chunks, `perRow` to a line. */
-function runningRows(running, { perRow, st, sym, barWidth }) {
+/** The room the size class names of the running chunks take in a cell ("00013 small ..."), 0 without classes. */
+const classWidth = (running) => Math.max(0, ...running.map((c) => (c.sizeClass ? c.sizeClass.length + 1 : 0)));
+
+/** The cells of the running chunks, `perRow` to a line; `nameWidth` (see classWidth) holds the size class. */
+function runningRows(running, { perRow, st, sym, barWidth, nameWidth = 0 }) {
   const shown = running.slice(0, perRow * RUNNING_ROWS);
   const rows = [];
   for (let i = 0; i < shown.length; i += perRow) {
     const parts = [];
     for (const c of shown.slice(i, i + perRow)) {
       const percent = `${Math.round(c.percent)}%`.padStart(4);
-      parts.push([`${sym.run} `, st.cyan], [chunkId(c.id)], [' '], ...progressBar(barWidth, c.percent / 100, st, sym), [` ${percent}`, st.bold], [' '.repeat(CELL - (2 + 5 + 1 + barWidth + 5))]);
+      const name = nameWidth > 0 ? [[` ${(c.sizeClass ?? '').padEnd(nameWidth - 1)}`, st.dim]] : [];
+      parts.push([`${sym.run} `, st.cyan], [chunkId(c.id)], ...name, [' '], ...progressBar(barWidth, c.percent / 100, st, sym), [` ${percent}`, st.bold], [' '.repeat(CELL - (2 + 5 + 1 + barWidth + 5))]);
     }
     rows.push(parts);
   }
@@ -173,9 +177,10 @@ export function renderMigrationDashboard(state, { columns = 80, rows, color = fa
         [`${sym.fail} failed ${formatCount(snap.failed)}`, snap.failed > 0 ? st.red : st.dim],
       ]),
     );
-    const perRow = clamp(Math.floor(content / CELL), 1, 4);
+    const nameWidth = classWidth(snap.running ?? []);
+    const perRow = clamp(Math.floor(content / (CELL + nameWidth)), 1, 4);
     const room = rows ? Math.max(1, rows - 1 - lines.length - SHOWN_FAILURES - 2) : RUNNING_ROWS + 1;
-    for (const parts of runningRows(snap.running ?? [], { perRow, st, sym, barWidth: 10 }).slice(0, Math.min(RUNNING_ROWS + 1, room))) lines.push(row(parts));
+    for (const parts of runningRows(snap.running ?? [], { perRow, st, sym, barWidth: 10, nameWidth }).slice(0, Math.min(RUNNING_ROWS + 1, room))) lines.push(row(parts));
     // The error code comes first: it is the part that must survive when a long path is shortened.
     for (const { id, path, code } of (state.failures ?? []).slice(-SHOWN_FAILURES)) {
       lines.push(row([[`${sym.fail} `, st.red], [`${code ?? '?'}  `, st.red], [path, st.yellow], [`   (chunk ${chunkId(id)})`, st.dim]]));

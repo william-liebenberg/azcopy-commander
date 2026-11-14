@@ -38,17 +38,22 @@ so it can be stopped (Ctrl+C) and continued: the listing starts again after the 
                               that migration did not copy are carried into the delta's first chunks.
   --overwrite-modified        Also replace an existing blob when the S3 object is newer. Default is append-only:
                               existing blobs are never touched. Nothing is ever deleted.
-  --chunk-files <n>           Most objects per chunk (default 100000)
+  --size-profile <file>       Size classes from a JSON file (see README): each object goes to the chunk of its size
+                              class, each class with its own files per chunk and objects at once. Without it, and
+                              without --chunk-files and --concurrency, the default classes are used
+                              (< 1 MiB, < 64 MiB, < 1 GiB, < 100 GiB, larger).
+  --chunk-files <n>           Uniform chunks: most objects per chunk (default 100000)
   --chunk-bytes <size>        Most bytes per chunk, e.g. 500GiB or 2TiB (default 1TiB)
   --chunk-minutes <n>         Close a chunk that has objects after n minutes (default 15), so a delta copies early
   --parallel <n>              Chunks copied at once (default 4)
-  --concurrency <n>           Objects copied at once in each chunk (default 32)
+  --concurrency <n>           Uniform chunks: objects copied at once in each chunk (default 32)
   --block-size <size>         Above this size an object is copied in blocks (default 256MiB)
   --max-attempts <n>          Copy attempts per chunk, retries of failed files included (default 5)
   --stop-after inventory      List into chunks and analyse, copy nothing (continue the migration to copy)
   --migration <dir>           Continue this migration. Without it, and without --source-bucket, the latest one in
                               <output-dir> is shown and you are asked to confirm it (--yes skips the question).
-                              --parallel, --concurrency and --max-attempts can be changed when continuing.
+                              --parallel, --max-attempts and the objects at once (--size-profile, by class name, or
+                              --concurrency for uniform chunks) can be changed when continuing.
   --repeat                    After this migration, run delta migrations one after another (each based on the one
                               before it) until one finds few enough objects to stop the writers and cut over
   --repeat-until <n>          Stop repeating when a delta lists at most n objects (default 10000)
@@ -72,6 +77,7 @@ const options = {
   'overwrite-modified': { type: 'boolean' },
   'output-dir': { type: 'string' },
   'dry-run': { type: 'boolean' },
+  'size-profile': { type: 'string' },
   'chunk-files': { type: 'string' },
   'chunk-bytes': { type: 'string' },
   'chunk-minutes': { type: 'string' },

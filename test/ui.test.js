@@ -90,8 +90,20 @@ async function withEnv(values, fn, keys = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCE
 
 const typedCredentials = [KEY, SECRET, TOKEN, SAS];
 const sourceAnswers = ['bkt', 'data', 'ap-southeast-2', false]; // bucket, prefix, region, overwrite-modified
-/** chunk objects, chunk size, chunks at once, objects at once, when it ends, confirm */
-const migrateAnswers = (over = {}) => [over.chunkFiles ?? '2000', over.chunkBytes ?? '500GiB', over.parallel ?? '3', over.concurrency ?? '16', pick(over.ends ?? 'stop'), true];
+/** how to chunk, [chunk objects,] chunk size, chunks at once, [objects at once,] when it ends, confirm (by size class: no counts) */
+const migrateAnswers = (over = {}) => {
+  const uniform = (over.chunking ?? 'uniform') === 'uniform';
+  return [
+    pick(over.chunking ?? 'uniform'),
+    ...(over.chunking === 'profile' ? [over.sizeProfile] : []),
+    ...(uniform ? [over.chunkFiles ?? '2000'] : []),
+    over.chunkBytes ?? '500GiB',
+    over.parallel ?? '3',
+    ...(uniform ? [over.concurrency ?? '16'] : []),
+    pick(over.ends ?? 'stop'),
+    true,
+  ];
+};
 const migrateScript = () => [pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers()];
 
 test('fit shortens in the middle and leaves short text alone', () => {
@@ -173,6 +185,36 @@ test('large migration: the questions, their defaults and the summary; typed AWS 
   for (const secret of SECRET_TEXTS) assert.ok(!prompts.shown.join('\n').includes(secret));
 });
 
+test('large migration by size class: the chunking question, the class table, no counts asked; a profile file is on the command line', async () => {
+  const calls = [];
+  const out = sink();
+  const prompts = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers({ chunking: 'classes' })]);
+  assert.equal(await runWizard({ prompts, env: {}, out, baseOpts: { outputDir: 'unused' }, commands: spyCommands(calls), columns: 200 }), 0);
+  assert.equal(prompts.remaining(), 0);
+  const question = prompts.asked.find((a) => a.message === 'How should the listing be cut into chunks?');
+  assert.equal(question.initialValue, 'classes');
+  assert.deepEqual(question.options.map((o) => o.label), ['By size class (defaults)', 'By size class, from a profile file', 'Uniform chunks']);
+  assert.ok(!prompts.asked.some((a) => a.message.startsWith('Most objects in a chunk') || a.message.startsWith('Objects copied at once')));
+  assert.match(prompts.shown.find((s) => s.startsWith('note Size classes')), /very-small +< 1 MiB +100,000 files per chunk, 128 at once\n[^]*very-large +≥ 100 GiB +50 files per chunk, 2 at once/);
+  const summary = prompts.shown.find((s) => s.startsWith('note Summary'));
+  assert.match(summary, /Chunks +by size class \(defaults\), each at most its files per chunk or 500GiB, closed after 15 min/);
+  assert.match(summary, /Copy +as the chunks close: 3 chunk\(s\) at once, the objects at once of its size class in each/);
+  assert.deepEqual([calls[0].opts.chunkFiles, calls[0].opts.concurrency, calls[0].opts.sizeProfile], [undefined, undefined, undefined]);
+  assert.match(out.text(), /azcopy-commander migrate --source-bucket bkt --source-prefix data --source-region ap-southeast-2 --chunk-bytes 500GiB --parallel 3 /);
+
+  // from a profile file: it is checked when typed, and its absolute path is on the command line
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'azc-ui-profile-')), 'profile.json');
+  fs.writeFileSync(file, JSON.stringify({ classes: [{ name: 'small', below: '1MiB', chunkFiles: 10, concurrency: 64 }, { name: 'big', chunkFiles: 2, concurrency: 2 }] }));
+  const out2 = sink();
+  const withFile = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, ...migrateAnswers({ chunking: 'profile', sizeProfile: file })]);
+  assert.equal(await runWizard({ prompts: withFile, env: {}, out: out2, baseOpts: { outputDir: 'unused' }, commands: spyCommands(calls), columns: 200 }), 0);
+  assert.equal(withFile.remaining(), 0);
+  assert.match(withFile.asked.find((a) => a.message.startsWith('Size profile file')).validate(path.join(path.dirname(file), 'none.json')), /Cannot read the size profile/);
+  assert.match(withFile.shown.find((s) => s.startsWith('note Size classes')), /small +< 1 MiB +10 files per chunk, 64 at once\nbig +≥ 1 MiB +2 files per chunk, 2 at once/);
+  assert.equal(calls[1].opts.sizeProfile, file);
+  assert.ok(out2.text().includes(`--size-profile ${shellQuote(file)}`));
+});
+
 test('the menu has no azcopy action left', async () => {
   let options;
   const prompts = fakePrompts([(o) => ((options = o.options), 'quit')]);
@@ -220,7 +262,7 @@ test('an ARN prefix and a different typed prefix: the user chooses', async () =>
 });
 
 test('prompt validators reject bad input without leaking it', async () => {
-  const prompts = fakePrompts([pick('migrate'), KEY, SECRET, '', SAS, 'bkt', '', '', false, '10', '2TiB', '3', '8', pick('stop'), false, pick('quit')]);
+  const prompts = fakePrompts([pick('migrate'), KEY, SECRET, '', SAS, 'bkt', '', '', false, pick('uniform'), '10', '2TiB', '3', '8', pick('stop'), false, pick('quit')]);
   const calls = [];
   assert.equal(await runWizard({ prompts, env: {}, commands: spyCommands(calls) }), 0);
   assert.deepEqual(calls, [], 'declining runs nothing');
@@ -439,7 +481,7 @@ test('command line options: migrate takes them over without asking again', async
 test('command line options: "go through the questions" prefills them; options not given are asked', async () => {
   const calls = [];
   const presets = { sourceBucket: 'bkt', parallel: '4', overwriteModified: true };
-  const prompts = fakePrompts([pick('migrate'), cliSelect('review'), ...typedCredentials, (o) => o.initialValue, '', '', true, '2000', '1TiB', (o) => o.initialValue, '16', pick('stop'), true]);
+  const prompts = fakePrompts([pick('migrate'), cliSelect('review'), ...typedCredentials, (o) => o.initialValue, '', '', true, pick('uniform'), '2000', '1TiB', (o) => o.initialValue, '16', pick('stop'), true]);
   assert.equal(await runWizard({ prompts, env: {}, presets, commands: spyCommands(calls) }), 0);
   assert.equal(prompts.remaining(), 0);
   const initial = (m) => prompts.asked.find((a) => a.message.includes(m)).initialValue;
@@ -452,7 +494,7 @@ test('command line options: "go through the questions" prefills them; options no
 
 test('command line options: an unusable one is reported and asked for as usual', async () => {
   const calls = [];
-  const prompts = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, '', 'ap-southeast-2', false, '2000', '1TiB', '4', '32', pick('stop'), true]);
+  const prompts = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, '', 'ap-southeast-2', false, pick('uniform'), '2000', '1TiB', '4', '32', pick('stop'), true]);
   await runWizard({ prompts, env: {}, presets: { sourceBucket: 'bkt', sourceRegion: 'nowhere', parallel: '0' }, commands: spyCommands(calls) });
   assert.match(prompts.shown.join('\n'), /warn: --source-region from the command line is not usable[^]*warn: --parallel from the command line is not usable/);
   assert.ok(prompts.asked.some((a) => a.message.includes('AWS region')), 'the region is asked for');
@@ -548,7 +590,7 @@ test('command line options: --last-copy-date auto answers the baseline question 
 
 test('wizard: "Keep running deltas" passes --repeat and its limit; command line options answer the question', async () => {
   const calls = [];
-  const prompts = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, '2000', '1TiB', '4', '32', pick('repeat'), (o) => (assert.equal(o.initialValue, '10000'), '5000'), true]);
+  const prompts = fakePrompts([pick('migrate'), ...typedCredentials, ...sourceAnswers, pick('uniform'), '2000', '1TiB', '4', '32', pick('repeat'), (o) => (assert.equal(o.initialValue, '10000'), '5000'), true]);
   assert.equal(await runWizard({ prompts, env: {}, commands: spyCommands(calls) }), 0);
   assert.equal(prompts.remaining(), 0);
   assert.deepEqual([calls[0].opts.repeat, calls[0].opts.repeatUntil, calls[0].opts.repeatMax], [true, '5000', undefined]);
@@ -556,7 +598,7 @@ test('wizard: "Keep running deltas" passes --repeat and its limit; command line 
   assert.match(prompts.asked.find((a) => a.message.startsWith('Stop when a delta')).validate('x'), /whole number/);
 
   const presets = { sourceBucket: 'bkt', repeat: true, repeatUntil: '200', repeatMax: '3' };
-  const fromCli = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, false, '2000', '1TiB', '4', '32', true]);
+  const fromCli = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, false, pick('uniform'), '2000', '1TiB', '4', '32', true]);
   assert.equal(await runWizard({ prompts: fromCli, env: {}, presets, commands: spyCommands(calls) }), 0);
   assert.equal(fromCli.remaining(), 0);
   assert.deepEqual([calls[1].opts.repeat, calls[1].opts.repeatUntil, calls[1].opts.repeatMax], [true, '200', '3']);
@@ -565,7 +607,7 @@ test('wizard: "Keep running deltas" passes --repeat and its limit; command line 
 
 test('wizard: --stop-after inventory needs no "when it ends" question and is shown in the summary', async () => {
   const calls = [];
-  const prompts = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, false, '2000', '1TiB', '4', '32', true]);
+  const prompts = fakePrompts([pick('migrate'), cliSelect('use'), ...typedCredentials, false, pick('uniform'), '2000', '1TiB', '4', '32', true]);
   assert.equal(await runWizard({ prompts, env: {}, presets: { sourceBucket: 'bkt', stopAfter: 'inventory', repeat: true }, commands: spyCommands(calls) }), 0);
   assert.equal(prompts.remaining(), 0);
   assert.equal(calls[0].opts.stopAfter, 'inventory');
@@ -615,6 +657,7 @@ const AGGREGATE = {
   copied: 3012554, ignored: 0, failed: 3, bytesDone: 44.1 * 2 ** 40, bytesTotal: 184.2 * 2 ** 40, percent: 23.9, throughput: 1.62 * 2 ** 30, etaSeconds: 90720, elapsedSeconds: 600,
 };
 const LISTING = { ...AGGREGATE, listing: true, listed: 3_100_000, etaSeconds: NaN };
+const CLASSED = { ...AGGREGATE, running: AGGREGATE.running.map((c, i) => ({ ...c, sizeClass: ['very-small', 'small', 'large', 'very-large'][i] })) };
 const MIG_STATE = {
   title: 'Migrating  my-bucket → files3', phase: 'copying', frame: 2, elapsedSeconds: 134, snapshot: AGGREGATE, parallel: 10,
   speeds: [1, 2, 3, 4, 5, 6, 5, 6], failures: [{ id: 9, path: 'data/2024/big file.bin', code: 'AuthorizationFailure' }], logFile: 'runs\\m\\migration.log', output: [],
@@ -636,6 +679,11 @@ test('renderMigrationDashboard: the copy phase shows the bar, ETA, chunk counter
   const crowded = plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: many }, { columns: 120 }));
   assert.match(crowded, /\+\d+ more running/);
   assert.ok(renderMigrationDashboard({ ...MIG_STATE, snapshot: many }, { columns: 120 }).length < 20);
+
+  // a chunk of a size class shows the class next to its id, the cells keep their columns
+  const classes = plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: CLASSED }, { columns: 120 }));
+  assert.match(classes, /▶ 00013 very-small █+░* +71%/);
+  assert.match(classes, /▶ 00014 small {6}█*░+ +18%/);
 });
 
 test('renderMigrationDashboard: while the listing runs the copy has a listing line, a total with a + and no ETA', () => {
@@ -666,6 +714,7 @@ test('renderMigrationDashboard: no line is wider than the terminal at any width,
   const states = [
     MIG_STATE,
     { ...MIG_STATE, snapshot: LISTING },
+    { ...MIG_STATE, snapshot: CLASSED },
     { ...MIG_STATE, snapshot: null },
     { ...MIG_STATE, phase: 'inventory', inventory: { files: 12, bytes: 99 } },
     { ...MIG_STATE, phase: 'analysis', analysis: ['x'.repeat(200)] },

@@ -51,36 +51,76 @@ node bin/azcopy-commander.js ui
 
 ## How a migration runs
 
-The listing and the copy run together in one process. The S3 `ListObjectsV2` listing (1,000 keys per page) writes chunk files; a pool of `--parallel` chunk workers copies the closed chunks, `--concurrency` objects at once in each.
+The listing and the copy run together in one process. The S3 `ListObjectsV2` listing (1,000 keys per page) writes chunk files, each object into the open chunk of its **size class**; a pool of `--parallel` chunk workers copies the closed chunks in the order they close, each with the objects at once of its class.
 
 ```mermaid
 flowchart LR
-  L[ListObjectsV2 pages] --> W[Chunk writer<br/>open chunk 00042.jsonl.partial]
-  W -- "full (--chunk-files, --chunk-bytes)<br/>or --chunk-minutes old" --> S[Close: 00042.jsonl<br/>pending in migration.json<br/>save resumeAfter]
-  S --> Q[(Pending chunks)]
+  L[ListObjectsV2 pages] --> K{size class}
+  K -->|< 1 MiB| XS[open very-small chunk]
+  K -->|< 64 MiB| S[open small chunk]
+  K -->|< 1 GiB| M[open medium chunk]
+  K -->|< 100 GiB| LG[open large chunk]
+  K -->|≥ 100 GiB| XL[open very-large chunk]
+  XS & S & M & LG & XL -- "class files / --chunk-bytes reached,<br/>or --chunk-minutes old" --> C[Close: 00042.jsonl<br/>pending in migration.json<br/>save the listing positions]
+  C --> Q[(Pending chunks)]
   Q --> P[--parallel workers]
-  P --> C[--concurrency objects at once<br/>HEAD S3, presign GET, Put Blob From URL]
-  L -- listing ends --> E[Last chunk closed, analysis,<br/>the workers finish the queue]
+  P --> W[the objects at once of the chunk's class<br/>HEAD S3, presign GET, Put Blob From URL]
+  L -- listing ends --> E[Open chunks closed, analysis,<br/>the workers finish the queue]
 ```
 
-A chunk is closed when it holds `--chunk-files` objects, when the next object would take it past `--chunk-bytes` (an object larger than that gets a chunk of its own), or when it has had objects for `--chunk-minutes` minutes. The last rule is for deltas, which find few modified objects in a listing that can take days: their objects are copied early instead of at the end. When the listing ends, the analysis (`inventory-summary.json`: counts, size classes, the largest objects, top-level prefixes, archived objects) is computed from the chunk files and printed.
+A chunk is closed when it holds the files per chunk of its class, when the next object would take it past `--chunk-bytes` (or the `chunkBytes` of its class; an object larger than that gets a chunk of its own), or when it has had objects for `--chunk-minutes` minutes. Each class has its own open chunk, closed on its own. The last rule is for deltas, which find few modified objects in a listing that can take days: their objects are copied early instead of at the end. When the listing ends, the analysis (`inventory-summary.json`: counts, size classes, the largest objects, top-level prefixes, archived objects) is computed from the chunk files and printed.
 
 | Option | Meaning |
 |---|---|
-| `--chunk-files <n>` | Most objects per chunk (default 100000) |
+| `--size-profile <file>` | The size classes, from a JSON file (see [Size classes](#size-classes)). Without it, and without `--chunk-files` and `--concurrency`, the default classes are used. |
+| `--chunk-files <n>` | Uniform chunks: most objects per chunk (default 100000) |
 | `--chunk-bytes <size>` | Most bytes per chunk, e.g. `500GiB`, `2TiB` or a plain number (default 1TiB) |
 | `--chunk-minutes <n>` | Close a chunk that has objects after n minutes (default 15) |
 | `--parallel <n>` | Chunks copied at once (default 4) |
-| `--concurrency <n>` | Objects copied at once in each chunk (default 32) |
+| `--concurrency <n>` | Uniform chunks: objects copied at once in each chunk (default 32) |
 | `--block-size <size>` | Above this size an object is copied in blocks (default 256MiB) |
 | `--max-attempts <n>` | Copy attempts per chunk, retries of failed files included (default 5) |
 | `--stop-after inventory` | List into chunks and analyse, copy nothing; continue the migration to copy |
-| `--migration <dir>` | Continue this migration. The options it started with (source, chunk limits, block size) are kept; `--parallel`, `--concurrency` and `--max-attempts` can be changed. The SAS is asked for again (it is never written down) and must target the same container. |
+| `--migration <dir>` | Continue this migration. The options it started with (source, size classes or chunk limits, block size) are kept; `--parallel`, `--max-attempts` and the objects at once can be changed (`--size-profile` for size classes, `--concurrency` for uniform chunks). The SAS is asked for again (it is never written down) and must target the same container. |
 | `--repeat` | After this migration, run delta migrations one after another (see [Keeping up with a growing bucket](#keeping-up-with-a-growing-bucket)). Not with `--stop-after`. |
 | `--repeat-until <n>` | Stop repeating when a delta lists at most n objects (default 10000) |
 | `--repeat-max <n>` | At most n delta migrations (default 10) |
 
 Also accepted: `--source-prefix`, `--source-region`, `--last-copy-date`, `--overwrite-modified`, `--output-dir`, `--dry-run`, `-y/--yes`.
+
+### Size classes
+
+32 objects at once is too few for a chunk of 4 KiB files and too many for a chunk of 200 GiB files, so each object goes to the chunk of its size class, and each class has its own copy profile. The defaults:
+
+| Class | Size | Files per chunk | Objects at once |
+| --- | --- | ---: | ---: |
+| `very-small` | < 1 MiB | 100,000 | 128 |
+| `small` | 1 MiB – < 64 MiB | 50,000 | 64 |
+| `medium` | 64 MiB – < 1 GiB | 10,000 | 16 |
+| `large` | 1 GiB – < 100 GiB | 1,000 | 8 |
+| `very-large` | ≥ 100 GiB | 50 | 2 |
+
+An object above `--block-size` is already copied 8 blocks at a time, so the large classes need few objects at once. `--chunk-bytes` and `--chunk-minutes` apply to every class; a class may have its own `chunkBytes`. A profile file replaces the whole list: 1 to 10 classes, names of lower-case letters, digits and dashes, `below` growing from one class to the next, the last class without one; sizes are numbers of bytes or texts such as `64MiB`.
+
+```json
+{
+  "classes": [
+    { "name": "very-small", "below": "1MiB",   "chunkFiles": 100000, "concurrency": 128 },
+    { "name": "small",      "below": "64MiB",  "chunkFiles": 50000,  "concurrency": 64 },
+    { "name": "medium",     "below": "1GiB",   "chunkFiles": 10000,  "concurrency": 16 },
+    { "name": "large",      "below": "100GiB", "chunkFiles": 1000,   "concurrency": 8, "chunkBytes": "4TiB" },
+    { "name": "very-large",                     "chunkFiles": 50,     "concurrency": 2 }
+  ]
+}
+```
+
+```text
+azcopy-commander migrate --source-bucket my-bucket --size-profile .\profile.json --parallel 4
+```
+
+The classes are saved in `migration.json` (`options.sizeClasses`, sizes in bytes), so a continued migration and the deltas of `--repeat` chunk the same way, and each chunk records its `sizeClass`. `--dry-run`, the log and the console show the class table, and chunk lines show the class (`chunk 00042 (small) listed: 50,000 objects, 1.20 GiB`). When continuing, `--size-profile` may be given again to change the `concurrency` of each class (matched by name); a change to its bounds or files per chunk is reported and ignored, since its chunks exist. `--concurrency` is then an error that points to `--size-profile`.
+
+**Uniform chunks**, as before size classes: a migration given `--chunk-files` or `--concurrency` (and no `--size-profile`) has one kind of chunk, `--chunk-files` objects at most, `--concurrency` objects at once. Migrations started before size classes are uniform and are continued as before.
 
 ### How one object is copied
 
@@ -93,7 +133,7 @@ Each object is one S3 `HeadObject` (size, last-modified time, content headers an
 * **Headers and metadata**: `Content-Type`, `Content-Encoding`, `Content-Language`, `Content-Disposition` and `Cache-Control` are copied, and the S3 user metadata. A metadata name that is not valid in Azure (it must be a C# identifier, so not `original-filename`) is left out and logged once per chunk.
 * **Results**: *copied*; *ignored* (already at the target); *missing* (the S3 HEAD is 404: the object was deleted after the listing; not retried, not carried); *failed* (any other error, after the SDKs' own retries), with a record in the chunk attempt's `failed-<ts>.jsonl`. One failed object does not fail the others.
 * **Presigned URLs** are made per request (per block for large objects) with a one-hour expiry and are never logged or written down. A URL longer than the 2 KiB that Azure accepts for a copy source (usually a long `AWS_SESSION_TOKEN`) fails the object with the code `SourceUrlTooLong` without calling Azure.
-* **Connections**: the S3 client gets an HTTPS agent with `--parallel` x `--concurrency` sockets.
+* **Connections**: the S3 client gets an HTTPS agent with `--parallel` x (the largest objects at once of a class, or `--concurrency`) + 8 sockets.
 
 ### Chunk attempts, failures and Ctrl+C
 
@@ -101,7 +141,7 @@ A chunk attempt is a folder `chunks/00007/<timestamp>-chunk/` with `run.json`, `
 
 When every chunk is copied the migration is `success`; `success` or `partial` saves the **start of the migration** in `state.json` for this source and target, so `--last-copy-date auto` afterwards picks up what was written since.
 
-Ctrl+C aborts the listing and the requests in flight, saves `migration.json` and exits with 130. `migrate --migration <dir>` continues: the closed chunks keep their status and the unfinished ones are copied again, and the listing starts again **after the last closed chunk** (`StartAfter`, from `resumeAfter` in `migration.json`). The open chunk is listed again, so no key is in two chunks. A listing that fails (an S3 error after the SDK's retries) lets the workers finish the closed chunks; the migration then ends `failed`, and continuing it lists again from the last closed chunk.
+Ctrl+C aborts the listing and the requests in flight, saves `migration.json` and exits with 130. `migrate --migration <dir>` continues: the closed chunks keep their status and the unfinished ones are copied again, and the listing starts again from where every object listed before is in a closed chunk (`StartAfter`, from `resumeAfter` in `migration.json`). With size classes several chunks are open at once: when the `large` chunk closes, the `small` one may still hold keys listed earlier. So each close saves `listedThrough` (the last key listed; skipped and excluded keys are done up to it), `closedThrough` per class (every object of the class up to that key is in a closed chunk) and `resumeAfter`, the smallest of them. A key listed again up to `listedThrough` is left out unless it is after `closedThrough` of its class (it was in an open chunk, which is lost): no key is lost, and none is in two chunks. Keys are compared in S3's order (UTF-8 bytes). Since every open chunk closes after `--chunk-minutes`, a continued listing lists again at most about that much. A listing that fails (an S3 error after the SDK's retries) lets the workers finish the closed chunks; the migration then ends `failed`, and continuing it lists again from the last closed chunk.
 
 ### The migration folder (`runs/<timestamp>-migration/`, `runs/<timestamp>-delta-migration/`)
 
@@ -110,7 +150,7 @@ runs/20261113T020000Z-migration/
   migration.json                       format 2: the options, the state of the listing, one entry per chunk
   inventory-summary.json               the analysis, written when the listing ends
   chunks/00001.jsonl                   {"path":"a b.txt","size":10,"lastModified":"2024-03-01T10:00:00.000Z","storageClass":"STANDARD"}
-  chunks/00043.jsonl.partial           the open chunk (deleted and listed again on continue)
+  chunks/00043.jsonl.partial           an open chunk, one per size class (deleted and listed again on continue)
   chunks/skipped.jsonl                 keys that are not copied, with the reason
   chunks/00001/20261113T020512Z-chunk/ one attempt: run.json, copy-<ts>.log, failed-<ts>.jsonl
   migration-<ts>.log                   phases, chunk starts and ends, the progress line every 30 s
@@ -118,7 +158,7 @@ runs/20261113T020000Z-migration/
 
 | File | Content |
 |---|---|
-| `migration.json` | The options, the listing (`status`, `resumeAfter`: the full key of the last object of the last closed chunk, counts) and one entry per chunk (status, attempts, files, bytes, counters, attempt folders). A delta also records `includeAfter`, its `baseline` and the `carried` files. Written atomically. |
+| `migration.json` | The options (with `sizeClasses`), the listing (`status`, the full keys `listedThrough`, `closedThrough` per class and `resumeAfter`, counts of the closed chunks) and one entry per chunk (status, attempts, files, bytes, `sizeClass`, counters, attempt folders). A listing saved before size classes has only `resumeAfter`, which then stands for all three. A delta also records `includeAfter`, its `baseline` and the `carried` files. Written atomically. |
 | `chunks/<id>.jsonl` | The inventory: one object per line, with the path relative to the prefix. JSON lines because S3 keys may contain tabs. There is no separate inventory file. |
 | `chunks/skipped.jsonl` | Keys that are not copied: a key with a line break, and an object of an archive class (`GLACIER`, `DEEP_ARCHIVE`) that is not restored. A restored object is copied as usual. Reported in the analysis and the summary. |
 
@@ -140,7 +180,7 @@ Delta:     objects modified on/after 2026-11-12T01:50:00Z (start of runs\2026111
 Carried:   1,204 file(s) that runs\20261112T020000Z-migration did not copy (2 chunk(s)), 3.10 GiB, in the first chunk(s)
 ```
 
-* **Carried files.** When the baseline is a migration, the delta starts with what that migration did not copy: the failed files of the last attempt of each `exhausted` chunk. They are written as the delta's first chunks, marked `carried`, before the listing starts, so they are copied at once. A key that is both carried and modified stays in its carried chunk and is left out of the listed chunks: one key is in one chunk. The baseline migration is not changed; a file that fails again is carried into the next delta. A typed `--last-copy-date` carries nothing.
+* **Carried files.** When the baseline is a migration, the delta starts with what that migration did not copy: the failed files of the last attempt of each `exhausted` chunk. They are written as the delta's first chunks (by size class, each by its files per chunk), marked `carried`, before the listing starts, so they are copied at once. A key that is both carried and modified stays in its carried chunk and is left out of the listed chunks: one key is in one chunk. The baseline migration is not changed; a file that fails again is carried into the next delta. A typed `--last-copy-date` carries nothing.
 * **What a delta costs.** S3 cannot filter by date on the server, so every delta **lists the whole prefix** and filters as it goes: a delta takes at least as long as a full listing. `--chunk-minutes` makes it copy what it finds while it lists. The listing time sets the shortest gap between deltas, which is why `--repeat-until` defaults to 10,000 rather than 0 and the last step is to stop the writers.
 * **Nothing to copy.** A delta with no modified objects and nothing carried ends as `success` with 0 chunks, and still moves the baseline forward.
 * **The baseline only moves forward.** A migration that ends after a newer one was recorded (an older migration continued late) keeps the newer `state.json` entry, so `auto` never goes back in time.
@@ -155,8 +195,9 @@ A migration made by version 1 (azcopy; its `migration.json` has no `"format": 2`
 
 ### Tuning and limits
 
-* **Throughput** comes from the number of copy requests in flight, `--parallel` x `--concurrency` (default 128): Azure does the copying, and this machine only sends requests and waits. Raise `--concurrency` for many small objects; large objects are already split into blocks, 8 at a time.
-* The first chunk closes after `--chunk-files` objects or `--chunk-minutes` minutes, so with the defaults the copy starts within minutes of the listing. The total size and the ETA are known only when the listing ends.
+* **Throughput** comes from the number of copy requests in flight, `--parallel` x the objects at once of the chunks being copied: Azure does the copying, and this machine only sends requests and waits. Raise the `concurrency` of the small classes in a profile for many small objects (or `--concurrency` for uniform chunks); large objects are already split into blocks, 8 at a time. The defaults (128 at once for very small files, x `--parallel 4`) are a starting point: they raise the request rate on S3 HEAD and Azure, so check them on a real run and lower them if S3 or Azure throttles.
+* An object whose size changes between a stop and the continued listing can change class: it may be copied twice (the second copy is *ignored*) or, rarely, left out; it was modified after the migration started, so the next delta copies it.
+* The first chunk closes after its class's files per chunk or `--chunk-minutes` minutes, so with the defaults the copy starts within minutes of the listing. The total size and the ETA are known only when the listing ends.
 * **Not copied**: keys with a line break, archived objects that are not restored (restore them first, then run a delta), objects modified after the listing passed their key (run a delta).
 * **The bucket must be readable from Azure with a presigned URL**: a bucket policy that limits access by source IP or VPC endpoint makes every copy fail with an authorization error.
 * Temporary credentials: a presigned URL is valid at most as long as the session token it is signed with, and a long session token can make the URL too long (`SourceUrlTooLong`); prefer the keys of an IAM user for a long migration.
@@ -179,10 +220,10 @@ A step-by-step wizard instead of a long command line. It asks for:
 2. **AWS credentials**: taken from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` when they are set (you choose *Use them* or *Enter other credentials*), otherwise typed with hidden input (plus an optional session token).
 3. **The target SAS URL** (not for *List*): from `AZCOPY_COMMANDER_TARGET_SAS_URL` or typed hidden. It is validated as you type (container URL, signature, write permission, expiry); warnings such as "expires soon" are shown, the signature never is.
 4. **The source**: bucket name **or ARN**, optional prefix and region, and whether to replace blobs when the S3 object is newer.
-5. **The migration**: the most objects and the most data in a chunk, the chunks copied at once and the objects copied at once in each (defaults prefilled: 100,000 objects, 1TiB, 4, 32), and what happens when it ends (*Stop*, or *Keep running deltas until one finds at most N objects*, which is `--repeat` with `--repeat-until N`).
+5. **The migration**: how the listing is cut into chunks (*By size class (defaults)*, *By size class, from a profile file*, which is `--size-profile`, or *Uniform chunks*; the class table is shown in a note), the most data in a chunk and the chunks copied at once, and for uniform chunks only the most objects in a chunk and the objects copied at once in each (defaults prefilled: 1TiB, 4; 100,000 objects, 32), and what happens when it ends (*Stop*, or *Keep running deltas until one finds at most N objects*, which is `--repeat` with `--repeat-until N`).
 6. A **summary** and a confirmation, then the migration runs with a live dashboard (below).
 
-Just before it starts, the wizard prints the command line that runs the same migration without the wizard, on a line of its own so you can copy it, for example `azcopy-commander migrate --source-bucket my-bucket --source-region ap-southeast-2 --chunk-files 100000 --chunk-bytes 1TiB --parallel 4 --concurrency 32 --output-dir C:\migrations\runs` (or `migrate --migration <folder> ...` when it continues one). No secret is in it: set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`) and `AZCOPY_COMMANDER_TARGET_SAS_URL` before you run it. The output directory is made absolute, and values are quoted for PowerShell on Windows and for a POSIX shell elsewhere. A delta based on a migration picked in the wizard gets its date as `--last-copy-date`: run from the command line, it does not carry the files that migration did not copy (`--last-copy-date auto` does, from the latest migration of the same source and target).
+Just before it starts, the wizard prints the command line that runs the same migration without the wizard, on a line of its own so you can copy it, for example `azcopy-commander migrate --source-bucket my-bucket --source-region ap-southeast-2 --size-profile C:\migrations\profile.json --chunk-bytes 1TiB --parallel 4 --output-dir C:\migrations\runs` (or `migrate --migration <folder> ...` when it continues one). No secret is in it: set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`) and `AZCOPY_COMMANDER_TARGET_SAS_URL` before you run it. The output directory is made absolute, and values are quoted for PowerShell on Windows and for a POSIX shell elsewhere. A delta based on a migration picked in the wizard gets its date as `--last-copy-date`: run from the command line, it does not carry the files that migration did not copy (`--last-copy-date auto` does, from the latest migration of the same source and target).
 
 A *delta migration* first asks for the baseline: a migration that ended `success` or `partial` (it fills in the source and `--overwrite-modified`, carries its failed files over and copies the objects modified since it started minus 10 minutes), or *Enter a date instead*, the only choice when no migration has finished yet; a target that differs from the baseline's asks for confirmation. *Continue a migration* lists the unfinished migrations in the output directory (`--output-dir`, default `./runs`), newest first, with their mode (`full` or `delta`), phase and chunks done, asks for the credentials again and continues the one you pick (a SAS for another target is refused; a migration made with azcopy is not offered).
 
@@ -225,8 +266,8 @@ Exit codes: `0` ok, `1` completed with failed files, `2` failed, `64` usage erro
 
 ## What was and was not verified
 
-* **Version 2 (Azure SDK) is verified with the fakes only.** It has not been run against a real S3 bucket or storage account yet: the 319-object bucket used for version 1 was not available. The tests cover: copying starts while the listing runs (a listing held at page 3 until chunk 1 is copied); chunk boundaries by files, by bytes and by age; a delta that finds 3 objects in a long listing copies them before the listing ends; Ctrl+C during the listing and during the copy, and continuing, with every key in exactly one chunk and copied once; a failed listing; append-only, `--overwrite-modified`, zero-byte objects, staged blocks above `--block-size`, S3 404 as missing, `SourceUrlTooLong`, invalid metadata names; archived and restored objects; retries of failed files, exhausted chunks carried into a delta; the `--parallel` and `--concurrency` limits; no secret or presigned signature on disk or on screen; a migration folder made with azcopy; `list`; the wizard flows and the dashboard with scripted prompts and a fake terminal.
-* **Not verified, needed before a production-size run**: a real copy (Put Blob From URL and Put Block From URL from presigned S3 URLs, key names with spaces and non-ASCII characters, content headers and metadata at the target, the error codes Azure returns for an existing blob and an unreadable source); the region lookup with `HeadBucket`; the throughput of `--parallel` x `--concurrency` and the S3 request rate it causes; the listing of millions of keys; interactive use of the dashboard in Windows Terminal.
+* **Version 2 (Azure SDK) is verified with the fakes only.** It has not been run against a real S3 bucket or storage account yet: the 319-object bucket used for version 1 was not available. The tests cover: copying starts while the listing runs (a listing held at page 3 until chunk 1 is copied); chunk boundaries by files, by bytes and by age; a delta that finds 3 objects in a long listing copies them before the listing ends; Ctrl+C during the listing and during the copy, and continuing, with every key in exactly one chunk and copied once; a failed listing; append-only, `--overwrite-modified`, zero-byte objects, staged blocks above `--block-size`, S3 404 as missing, `SourceUrlTooLong`, invalid metadata names; archived and restored objects; retries of failed files, exhausted chunks carried into a delta; the `--parallel` and `--concurrency` limits; chunking by size class, the objects at once of each class, and a listing stopped with chunks of several classes open, then continued (no key lost or in two chunks, keys outside the BMP included); a `migration.json` from before size classes continued as before; no secret or presigned signature on disk or on screen; a migration folder made with azcopy; `list`; the wizard flows and the dashboard with scripted prompts and a fake terminal.
+* **Not verified, needed before a production-size run**: a real copy (Put Blob From URL and Put Block From URL from presigned S3 URLs, key names with spaces and non-ASCII characters, content headers and metadata at the target, the error codes Azure returns for an existing blob and an unreadable source); the region lookup with `HeadBucket`; the throughput of `--parallel` x `--concurrency` and the S3 request rate it causes; the default size classes and their settings on a real bucket of mixed sizes (`--stop-after inventory`, then continue); the listing of millions of keys; interactive use of the dashboard in Windows Terminal.
 
 ### Before 2.0 (azcopy)
 

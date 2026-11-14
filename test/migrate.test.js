@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ChunkWriter, writeCarriedChunks, readChunkRecords } from '../src/chunks.js';
+import { classOf, compareKeys, DEFAULT_SIZE_CLASSES, readSizeProfile } from '../src/size-classes.js';
+import { UsageError } from '../src/errors.js';
 import { analyseInventory, analysisLines, s3Provider } from '../src/inventory.js';
 import { MigrationProgress, formatAggregate } from '../src/migration-view.js';
 import { collectCarried, listMigrations, migrateCommand, readMigration } from '../src/migration.js';
@@ -59,10 +61,10 @@ const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =
 // ------------------------------------------------------------- the chunk writer
 
 /** A ChunkWriter in a new folder that records the chunks it closes. */
-function writer(options = {}) {
+function writer({ maxFiles = 100, ...options } = {}) {
   const dir = tmp('chunks');
   const closed = [];
-  const w = new ChunkWriter({ chunksDir: path.join(dir, 'chunks'), maxFiles: 100, maxBytes: 1000, onClosed: async (c, after) => closed.push({ ...c, after }), ...options }).open();
+  const w = new ChunkWriter({ chunksDir: path.join(dir, 'chunks'), classes: [{ chunkFiles: maxFiles }], maxBytes: 1000, onClosed: async (c, at) => closed.push({ ...c, after: at.resumeAfter, at }), ...options }).open();
   return { dir, w, closed };
 }
 const rec = (p, size = 1, extra = {}) => ({ path: p, key: `data/${p}`, size, ...extra });
@@ -137,7 +139,7 @@ test('ChunkWriter: line breaks and archived objects go to skipped.jsonl; exclude
   assert.ok(fs.existsSync(path.join(dir, 'chunks/00002.jsonl.partial')));
   assert.equal(readLines(skippedFile).length, 3);
 
-  const again = new ChunkWriter({ chunksDir: path.join(dir, 'chunks'), maxFiles: 2, maxBytes: 1000, nextId: 2, skippedBytes: savedBytes }).open();
+  const again = new ChunkWriter({ chunksDir: path.join(dir, 'chunks'), classes: [{ chunkFiles: 2 }], maxBytes: 1000, nextId: 2, skippedBytes: savedBytes }).open();
   assert.ok(!fs.existsSync(path.join(dir, 'chunks/00002.jsonl.partial')), 'the open chunk is deleted');
   assert.equal(readLines(skippedFile).length, 2, 'skipped.jsonl is cut back');
   await again.add(rec('c'));
@@ -147,9 +149,108 @@ test('ChunkWriter: line breaks and archived objects go to skipped.jsonl; exclude
 
 test('writeCarriedChunks: the carried files as the first chunks, split by --chunk-files', () => {
   const dir = tmp('carried');
-  const chunks = writeCarriedChunks({ carried: new Map([['a', 1], ['b', 2], ['c', 3]]), chunksDir: path.join(dir, 'chunks'), maxFiles: 2 });
+  const chunks = writeCarriedChunks({ carried: new Map([['a', 1], ['b', 2], ['c', 3]]), chunksDir: path.join(dir, 'chunks'), classes: [{ chunkFiles: 2 }] });
   assert.deepEqual(chunks, [{ id: 1, list: 'chunks/00001.jsonl', files: 2, bytes: 3, carried: true }, { id: 2, list: 'chunks/00002.jsonl', files: 1, bytes: 3, carried: true }]);
   assert.deepEqual(readChunkRecords(path.join(dir, 'chunks/00002.jsonl')), [{ path: 'c', size: 3 }]);
+});
+
+// ------------------------------------------------------------- size classes
+
+/** A size profile file with `classes`; returns its path. */
+function profileFile(classes) {
+  const file = path.join(tmp('profile'), 'profile.json');
+  fs.writeFileSync(file, typeof classes === 'string' ? classes : JSON.stringify({ classes }));
+  return file;
+}
+
+const TWO_CLASSES = [{ name: 'small', below: 100, chunkFiles: 2, concurrency: 4 }, { name: 'big', chunkFiles: 3, concurrency: 1, chunkBytes: 1000 }];
+
+test('size classes: the defaults, the class of a size (`below` is the next class), S3 key order, a profile file', () => {
+  assert.deepEqual(DEFAULT_SIZE_CLASSES.map((c) => [c.name, c.below, c.chunkFiles, c.concurrency]), [
+    ['very-small', 2 ** 20, 100_000, 128], ['small', 64 * 2 ** 20, 50_000, 64], ['medium', 2 ** 30, 10_000, 16], ['large', 100 * 2 ** 30, 1_000, 8], ['very-large', undefined, 50, 2],
+  ]);
+  assert.deepEqual([0, 2 ** 20 - 1, 2 ** 20, 2 ** 30, 2 ** 50].map((s) => classOf(DEFAULT_SIZE_CLASSES, s).name), ['very-small', 'very-small', 'small', 'large', 'very-large']);
+  // outside the BMP: JavaScript and S3 (UTF-8 bytes) order these two keys differently
+  assert.ok('\u{1F600}' < '\uFF5A');
+  assert.ok(compareKeys('\u{1F600}', '\uFF5A') > 0);
+  assert.equal(compareKeys('a', 'a'), 0);
+
+  const file = profileFile([
+    { name: 'tiny', below: '1MiB', chunkFiles: 100, concurrency: 64 },
+    { name: 'huge', chunkFiles: 5, concurrency: 2, chunkBytes: '4TiB' },
+  ]);
+  assert.deepEqual(readSizeProfile(file), [{ name: 'tiny', below: 2 ** 20, chunkFiles: 100, concurrency: 64 }, { name: 'huge', chunkFiles: 5, concurrency: 2, chunkBytes: 4 * 2 ** 40 }]);
+
+  const bad = (content) => () => readSizeProfile(profileFile(content));
+  const last = { name: 'last', chunkFiles: 1, concurrency: 1 };
+  assert.throws(() => readSizeProfile(path.join(tmp('profile'), 'none.json')), (e) => e instanceof UsageError && /Cannot read the size profile .*no such file/.test(e.message));
+  assert.throws(bad('{ nope'), /is not valid JSON/);
+  assert.throws(bad([]), /1 to 10 classes/);
+  assert.throws(bad(Array.from({ length: 11 }, (_, i) => ({ ...last, name: `c${i}`, below: i + 1 }))), /1 to 10 classes/);
+  assert.throws(bad([{ ...last, name: 'Big Files' }]), /class 1 \("Big Files"\) needs a "name" of lower-case letters/);
+  assert.throws(bad([{ ...last, below: 5 }, { ...last }]), /the name "last" is used twice/);
+  assert.throws(bad([{ ...last, name: 'a', below: 1 }, { ...last, below: 5 }]), /the last class, "last", holds every larger object: it has no "below"/);
+  assert.throws(bad([{ ...last, name: 'a' }, last]), /class 1 \("a"\) needs "below"/);
+  assert.throws(bad([{ ...last, name: 'a', below: '64MiB' }, { ...last, name: 'b', below: '1MiB' }, last]), /"below" must grow from one class to the next: "b" \(1 MiB\) is not above "a" \(64 MiB\)/);
+  assert.throws(bad([{ ...last, chunkFiles: 0 }]), /Invalid "chunkFiles" of class 1 \("last"\)/);
+  assert.throws(bad([{ ...last, concurrency: 'many' }]), /Invalid "concurrency" of class 1/);
+  assert.throws(bad([{ ...last, name: 'a', below: 'lots' }, last]), /Invalid "below" of class 1/);
+  assert.throws(bad([{ ...last, parallel: 3 }]), /unknown setting\(s\) parallel/);
+});
+
+test('ChunkWriter by size class: each object in the chunk of its class; each class closes at its own files, bytes and age', async () => {
+  let now = 0;
+  const { dir, w, closed } = writer({ classes: TWO_CLASSES, maxAgeMs: 60_000, now: () => now });
+  await w.add(rec('a', 10)); // small: chunk 1
+  await w.add(rec('b', 100)); // `below` exactly: big, chunk 2
+  await w.add(rec('c', 99)); // small: chunk 1 is full (2 files)
+  assert.deepEqual(closed.map((c) => [c.id, c.sizeClass, c.files, c.bytes]), [[1, 'small', 2, 109]]);
+  assert.deepEqual(closed[0].at, { listedThrough: 'data/c', closedThrough: { small: 'data/c', big: 'data/a' }, resumeAfter: 'data/a' });
+  await w.add(rec('d', 500));
+  await w.add(rec('e', 600)); // 600 more would take chunk 2 past the big class's 1000 bytes: closed before e
+  assert.deepEqual(closed.at(-1).at, { listedThrough: 'data/d', closedThrough: { small: 'data/d', big: 'data/d' }, resumeAfter: 'data/d' });
+  now = 30_000;
+  await w.add(rec('f', 1)); // small: chunk 4, 30 s younger than chunk 3
+  now = 60_000;
+  await w.closeIfOld(); // only chunk 3 is old
+  assert.deepEqual(closed.map((c) => [c.id, c.sizeClass, c.files]), [[1, 'small', 2], [2, 'big', 2], [3, 'big', 1]]);
+  assert.deepEqual(closed.at(-1).at, { listedThrough: 'data/f', closedThrough: { small: 'data/e', big: 'data/f' }, resumeAfter: 'data/e' });
+  assert.ok(fs.existsSync(path.join(dir, 'chunks/00004.jsonl.partial')));
+  await w.end();
+  assert.deepEqual(closed.map((c) => [c.id, c.sizeClass, c.files, c.bytes]), [[1, 'small', 2, 109], [2, 'big', 2, 600], [3, 'big', 1, 600], [4, 'small', 1, 1]]);
+  assert.deepEqual(readChunkRecords(path.join(dir, 'chunks/00002.jsonl')).map((r) => r.path), ['b', 'd']);
+  assert.deepEqual([w.files, w.bytes, w.listed], [6, 1310, 6]);
+
+  // the big class closes at its own 3 files
+  const big = writer({ classes: TWO_CLASSES });
+  for (const p of ['x', 'y', 'z']) await big.w.add(rec(p, 200));
+  assert.deepEqual(big.closed.map((c) => [c.sizeClass, c.files]), [['big', 3]]);
+
+  // abandon deletes every open chunk
+  const both = writer({ classes: TWO_CLASSES });
+  await both.w.add(rec('a', 1));
+  await both.w.add(rec('b', 500));
+  await both.w.abandon();
+  assert.deepEqual(fs.readdirSync(path.join(both.dir, 'chunks')), []);
+});
+
+test('ChunkWriter by size class: a resumed listing drops what is recorded and adds again what was in a lost open chunk', async () => {
+  // stopped after: a (small, open chunk lost), b (big, closed), c (small, lost), d (big, closed); then e, not listed
+  const resume = { startAfter: null, listedThrough: 'data/d', closedThrough: { small: null, big: 'data/d' } };
+  const { w, closed } = writer({ classes: TWO_CLASSES, resume, nextId: 8 });
+  for (const [p, s] of [['a', 1], ['b', 500], ['c', 1], ['d', 500], ['e', 1]]) await w.add(rec(p, s));
+  await w.end();
+  assert.deepEqual(closed.map((c) => [c.id, c.sizeClass, c.files]), [[8, 'small', 2], [9, 'small', 1]]);
+  assert.deepEqual([w.files, w.listed], [3, 3]);
+  assert.deepEqual(closed[0].at, { listedThrough: 'data/d', closedThrough: { small: 'data/c', big: 'data/d' }, resumeAfter: 'data/c' });
+});
+
+test('writeCarriedChunks by size class: each class split by its own chunkFiles', () => {
+  const dir = tmp('carried');
+  const carried = new Map([['a', 1], ['b', 500], ['c', 2], ['d', 600], ['e', 3], ['f', 700], ['g', 800]]);
+  const chunks = writeCarriedChunks({ carried, chunksDir: path.join(dir, 'chunks'), classes: TWO_CLASSES });
+  assert.deepEqual(chunks.map((c) => [c.id, c.sizeClass, c.files, c.bytes, c.carried]), [[1, 'small', 2, 3, true], [2, 'small', 1, 3, true], [3, 'big', 3, 1800, true], [4, 'big', 1, 800, true]]);
+  assert.deepEqual(readChunkRecords(path.join(dir, 'chunks/00003.jsonl')).map((r) => r.path), ['b', 'd', 'f']);
 });
 
 // ------------------------------------------------------------- listing and analysis
@@ -557,6 +658,140 @@ test('migrate: --stop-after inventory lists into chunks and copies nothing; cont
   assert.equal(container.blobs.size, 3);
 });
 
+test('migrate by size class: every object copied, never more than the concurrency of its class at once', async () => {
+  const objects = { ...many(20, { name: 's', size: 10 }), ...many(6, { name: 'z', size: 1000 }) };
+  const { base, s3, container, migrationDir } = setup(objects, { pageSize: 5 });
+  s3.delayMs = 2;
+  container.delayMs = 5;
+  const inFlight = { small: 0, big: 0 };
+  const max = { small: 0, big: 0 };
+  const getClient = container.getBlockBlobClient.bind(container);
+  container.getBlockBlobClient = (name) => {
+    const client = getClient(name);
+    const cls = name.startsWith('data/s') ? 'small' : 'big';
+    return {
+      ...client,
+      async syncUploadFromURL(...args) {
+        max[cls] = Math.max(max[cls], ++inFlight[cls]);
+        try {
+          return await client.syncUploadFromURL(...args);
+        } finally {
+          inFlight[cls]--;
+        }
+      },
+    };
+  };
+  const classes = [{ name: 'small', below: 100, chunkFiles: 5, concurrency: 4 }, { name: 'big', chunkFiles: 2, concurrency: 1 }];
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, sizeProfile: profileFile(classes), parallel: '1' }, out), 0, out.text());
+  assert.equal(container.blobs.size, 26);
+  assert.deepEqual([max.small, max.big], [4, 1]);
+  const m = readMigration(migrationDir());
+  assert.deepEqual(m.options.sizeClasses, classes);
+  assert.equal(m.options.concurrency, undefined);
+  assert.deepEqual(m.chunks.map((c) => [c.sizeClass, c.files]), [['small', 5], ['small', 5], ['small', 5], ['small', 5], ['big', 2], ['big', 2], ['big', 2]]);
+  assert.deepEqual([m.inventory.files, m.inventory.closedThrough], [26, { small: 'data/z006.bin', big: 'data/z006.bin' }]);
+  const text = out.text();
+  assert.match(text, /chunk 00001 \(small\) listed: 5 objects, 50 B/);
+  assert.match(text, /chunk 00005 \(big\) success/);
+  assert.match(text, /1 chunk\(s\) at a time, the objects at once of its size class in each:\n {2}small +< 100 B +5 files per chunk, 4 at once\n {2}big +≥ 100 B +2 files per chunk, 1 at once/);
+});
+
+test('migrate by size class: Ctrl+C with open chunks of two classes after another closed; continuing loses and duplicates nothing', async () => {
+  // In S3's order (UTF-8 bytes) ｚ (U+FF5A) comes before 😀; JavaScript's string order has them the other way round.
+  const sizes = { a: 1, b: 500, '\uFF5A': 1, '\u{1F600}': 50, '\u{1F601}': 500, '\u{1F602}': 1, '\u{1F603}': 500, '\u{1F604}': 50 };
+  const { base, s3, container, migrationDir, chunkPaths } = setup(Object.fromEntries(Object.entries(sizes).map(([k, size]) => [`data/${k}`, { size }])), { pageSize: 2 });
+  const classes = [{ name: 'tiny', below: 10, chunkFiles: 5, concurrency: 2 }, { name: 'mid', below: 100, chunkFiles: 5, concurrency: 2 }, { name: 'big', chunkFiles: 2, concurrency: 2 }];
+  const ctrlC = new AbortController();
+  s3.beforePage = async (n) => {
+    if (n === 3) ctrlC.abort(); // pages: [a b] [ｚ 😀] [😁 😂] | [😃 😄]
+  };
+  assert.equal(await migrateCommand({ ...base, sizeProfile: profileFile(classes), abortSignal: ctrlC.signal }, sink()), 130);
+  const mdir = migrationDir();
+  let m = readMigration(mdir);
+  // b and 😁 closed the big chunk; the tiny chunk (a ｚ 😂) and the mid chunk (😀) were open
+  assert.deepEqual(m.chunks.map((c) => [c.id, c.sizeClass, c.files]), [[2, 'big', 2]]);
+  assert.deepEqual(m.inventory, { ...m.inventory, status: 'running', listedThrough: 'data/\u{1F601}', closedThrough: { tiny: null, mid: 'data/\uFF5A', big: 'data/\u{1F601}' }, resumeAfter: null, files: 2 });
+  assert.ok(!fs.readdirSync(path.join(mdir, 'chunks')).some((f) => f.endsWith('.partial')));
+
+  s3.pages.length = 0;
+  s3.beforePage = null;
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, sourceBucket: undefined, migration: mdir }, out), 0, out.text());
+  assert.equal(s3.pages[0].StartAfter, undefined);
+  m = readMigration(mdir);
+  const paths = chunkPaths(mdir);
+  assert.deepEqual([...paths].sort(), Object.keys(sizes).sort(), 'every key in a chunk');
+  assert.equal(new Set(paths).size, paths.length, 'no key twice');
+  assert.equal(m.inventory.files, m.chunks.reduce((s, c) => s + c.files, 0));
+  assert.equal(m.inventory.files, 8);
+  for (const c of m.chunks) for (const r of readChunkRecords(path.join(mdir, c.list))) assert.equal(c.sizeClass, classOf(classes, r.size).name);
+  assert.equal(container.blobs.size, 8);
+  assert.ok([...container.writeCount.values()].every((n) => n === 1));
+});
+
+test('migrate: a migration.json from before size classes (resumeAfter only) is continued as before', async () => {
+  const keys = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+  const { base, s3, container, migrationDir, chunkPaths } = setup(Object.fromEntries(keys.map((k) => [`data/${k}`, { size: 1 }])), { pageSize: 2 });
+  const ctrlC = new AbortController();
+  s3.beforePage = async (n) => {
+    if (n === 3) ctrlC.abort();
+  };
+  assert.equal(await migrateCommand({ ...base, chunkFiles: '2', abortSignal: ctrlC.signal }, sink()), 130);
+  const mdir = migrationDir();
+  const file = path.join(mdir, 'migration.json');
+  const legacy = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(legacy.options.sizeClasses, undefined);
+  delete legacy.inventory.listedThrough;
+  fs.writeFileSync(file, JSON.stringify(legacy, null, 2));
+
+  s3.pages.length = 0;
+  s3.beforePage = null;
+  assert.equal(await migrateCommand({ ...base, sourceBucket: undefined, migration: mdir, concurrency: '2' }, sink()), 0);
+  assert.equal(s3.pages[0].StartAfter, legacy.inventory.resumeAfter);
+  assert.deepEqual(chunkPaths(mdir), keys);
+  const m = readMigration(mdir);
+  assert.ok(m.chunks.every((c) => c.sizeClass === undefined));
+  assert.deepEqual([m.options.concurrency, m.inventory.files], [2, 8]);
+  assert.ok([...container.writeCount.values()].every((n) => n === 1));
+});
+
+test('migrate: the options of size classes, for a new migration and when continuing', async () => {
+  const { base, container, migrationDir } = setup({ ...many(3, { size: 10 }), ...many(2, { name: 'z', size: 1000 }) });
+  const classes = [{ name: 'small', below: 100, chunkFiles: 5, concurrency: 4 }, { name: 'big', chunkFiles: 2, concurrency: 1 }];
+  const profile = profileFile(classes);
+  await assert.rejects(migrateCommand({ ...base, sizeProfile: profile, chunkFiles: '10' }, sink()), /--chunk-files cannot be used with --size-profile/);
+  await assert.rejects(migrateCommand({ ...base, sizeProfile: profile, concurrency: '10' }, sink()), /--concurrency cannot be used with --size-profile/);
+  await assert.rejects(migrateCommand({ ...base, sizeProfile: path.join(tmp('profile'), 'none.json') }, sink()), /Cannot read the size profile/);
+
+  assert.equal(await migrateCommand({ ...base, sizeProfile: profile, stopAfter: 'inventory' }, sink()), 0);
+  const mdir = migrationDir();
+  const continued = { ...base, sourceBucket: undefined, migration: mdir };
+  await assert.rejects(migrateCommand({ ...continued, concurrency: '8' }, sink()), /--concurrency does not apply to a migration chunked by size class: give --size-profile/);
+
+  // only the concurrency of each class (by name) changes; anything else is reported and left as it is
+  const changed = profileFile([
+    { name: 'small', below: '1MiB', chunkFiles: 5, concurrency: 16 },
+    { name: 'big', below: '1GiB', chunkFiles: 9, concurrency: 3 },
+    { name: 'extra', chunkFiles: 1, concurrency: 1 },
+  ]);
+  const out = sink();
+  assert.equal(await migrateCommand({ ...continued, sizeProfile: changed, parallel: '3' }, out), 0, out.text());
+  assert.equal(container.blobs.size, 5);
+  const m = readMigration(mdir);
+  assert.deepEqual(m.options.sizeClasses, [{ ...classes[0], concurrency: 16 }, { ...classes[1], concurrency: 3 }]);
+  assert.equal(m.options.parallel, 3);
+  const text = out.text();
+  assert.match(text, /--size-profile changes below of class "small": ignored, since its chunks already exist/);
+  assert.match(text, /--size-profile changes below, chunkFiles of class "big": ignored/);
+  assert.match(text, /--size-profile class "extra" is not a class of this migration: ignored/);
+
+  // a uniform migration has no size classes to change
+  const uniform = setup(many(2));
+  assert.equal(await migrateCommand({ ...uniform.base, chunkFiles: '1', stopAfter: 'inventory' }, sink()), 0);
+  await assert.rejects(migrateCommand({ ...uniform.base, sourceBucket: undefined, migration: uniform.migrationDir(), sizeProfile: profile }, sink()), /--size-profile does not apply to this migration: it is chunked uniformly/);
+});
+
 test('migrate: --dry-run creates nothing and prints the phases, without secrets', async () => {
   const { dir, base, container } = setup(many(3));
   const out = sink();
@@ -565,9 +800,18 @@ test('migrate: --dry-run creates nothing and prints the phases, without secrets'
   assert.equal(container.requests.length, 0);
   const text = out.text();
   assert.match(text, /Dry run - would run a migration/);
-  assert.match(text, /chunks of at most 100,000 objects/);
-  assert.match(text, /4 chunk\(s\) at once, 32 object\(s\) at once in each/);
+  assert.match(text, /into chunks by size class/);
+  assert.match(text, /very-small {2}< 1 MiB {12}100,000 files per chunk, 128 at once/);
+  assert.match(text, /very-large {2}≥ 100 GiB {10}50 files per chunk, 2 at once/);
+  assert.match(text, /4 chunk\(s\) at once, the objects at once of its size class \(very-small 128, small 64, medium 16, large 8, very-large 2\) in each/);
   assert.ok(!text.includes('SECRETSIG123') && !text.includes(AWS_SECRET));
+
+  // uniform chunks: --chunk-files or --concurrency
+  const uniform = sink();
+  assert.equal(await migrateCommand({ ...base, dryRun: true, concurrency: '32' }, uniform), 0);
+  assert.match(uniform.text(), /chunks of at most 100,000 objects/);
+  assert.match(uniform.text(), /4 chunk\(s\) at once, 32 object\(s\) at once in each/);
+  assert.ok(!uniform.text().includes('size class'));
 });
 
 test('migrate: no SAS, AWS secret, session token or presigned signature in the migration folder or the output', async () => {

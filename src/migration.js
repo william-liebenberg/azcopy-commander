@@ -9,6 +9,7 @@ import { fileTimestamp, formatBytes, formatCount } from './format.js';
 import { askYesNo, deltaDateFor, outputRoot, readTarget, requireAwsCredentials, resolveLastCopyDate, resolveSource, stateFile } from './commands.js';
 import { analyseInventory, analysisLines, InventoryAborted, InventoryError, s3Provider } from './inventory.js';
 import { ChunkWriter, chunkId, parseCount, parseSize, readChunkRecords, writeCarriedChunks } from './chunks.js';
+import { concurrencyText, DEFAULT_SIZE_CLASSES, readSizeProfile, sizeClassLines } from './size-classes.js';
 import { containerFor, copyChunk, createCopier, DEFAULT_BLOCK_SIZE, targetDirectory } from './blob-copy.js';
 import { withS3 } from './s3.js';
 import { writeFileAtomic } from './files.js';
@@ -18,13 +19,18 @@ import { ChunkView, deltaLines, formatAggregate, isFinished, MigrationProgress, 
  * `migrate`: a large migration, recorded in a migration folder so it can be stopped and continued.
  *
  * The listing and the copy run together. S3 ListObjectsV2 pages are written into chunk files (chunks/00001.jsonl, ...)
- * as they come; each closed chunk goes to a queue that a pool of --parallel chunk workers copies, --concurrency objects
- * at once (see blob-copy.js). When the listing ends, the analysis (inventory-summary.json) is computed from the chunks.
+ * as they come, each object into the open chunk of its size class (`options.sizeClasses`, see size-classes.js; a
+ * uniform migration has one class); each closed chunk goes to a queue that a pool of --parallel chunk workers copies,
+ * the concurrency of its class objects at once (see blob-copy.js). When the listing ends, the analysis
+ * (inventory-summary.json) is computed from the chunks.
  *
- * migration.json (`format: 2`) is the record: the options, the state of the listing (`inventory`: status, `resumeAfter`
- * the last key of the last closed chunk, counts, the size of skipped.jsonl) and one entry per chunk
- * ({ id, list, files, bytes, status, attempts, runs, copied, ignored, missing, failed, bytesCopied, carried? }).
- * A migration continued lists again from `resumeAfter` (S3 lists keys in order), after deleting the open chunk.
+ * migration.json (`format: 2`) is the record: the options, the state of the listing (`inventory`: status, the
+ * positions `listedThrough`, `closedThrough` (per class) and `resumeAfter` (see ChunkWriter), counts of closed chunks,
+ * the size of skipped.jsonl) and one entry per chunk
+ * ({ id, list, files, bytes, sizeClass?, status, attempts, runs, copied, ignored, missing, failed, bytesCopied, carried? }).
+ * A migration continued lists again from `resumeAfter` (S3 lists keys in order), after deleting the open chunks, and
+ * leaves out what was already recorded. An `inventory` with `resumeAfter` alone (before size classes) reads as
+ * `listedThrough` and every `closedThrough` equal to it.
  *
  * A delta migration (`includeAfter` set, folder <ts>-delta-migration) lists only the objects modified on/after a
  * date. Its `baseline` ({ startedAt, dir } or null) is the migration or run the date came from; when that is a
@@ -102,19 +108,80 @@ export function listMigrations(opts = {}) {
 
 // ---------------------------------------------------------------- options
 
-/** Validates the migrate options (CLI strings or numbers); `base` holds the values of a migration being continued. */
-function parseOptions(opts, base = MIGRATION_DEFAULTS) {
-  const pick = (key, flag, parse) => (opts[key] === undefined ? base[key] ?? MIGRATION_DEFAULTS[key] : parse(opts[key], flag));
-  return {
-    chunkFiles: pick('chunkFiles', '--chunk-files', parseCount),
+/**
+ * Validates the migrate options (CLI strings or numbers): `{ options, warnings }`. `base` holds the options of a
+ * migration being continued (null for a new one).
+ *
+ * A new migration is chunked by size class (`options.sizeClasses`): the defaults, or the classes of --size-profile
+ * (`opts.sizeClasses`, already resolved, for the next delta of --repeat). Given --chunk-files or --concurrency
+ * without --size-profile, it is chunked uniformly, as before size classes: `options.chunkFiles` and
+ * `options.concurrency`, and no `sizeClasses`. A migration continued keeps its chunking; --size-profile can then
+ * change the `concurrency` of its classes (matched by name), nothing else.
+ */
+function parseOptions(opts, base = null) {
+  const pick = (key, flag, parse) => (opts[key] === undefined ? base?.[key] ?? MIGRATION_DEFAULTS[key] : parse(opts[key], flag));
+  const warnings = [];
+  const profile = () => readSizeProfile(path.resolve(String(opts.sizeProfile)));
+  let sizeClasses = null;
+  if (base) {
+    if (base.sizeClasses) {
+      if (opts.concurrency !== undefined) throw new UsageError('--concurrency does not apply to a migration chunked by size class: give --size-profile with the new "concurrency" of each class.');
+      sizeClasses = opts.sizeProfile === undefined ? base.sizeClasses : changedConcurrency(base.sizeClasses, profile(), warnings);
+    } else if (opts.sizeProfile !== undefined) {
+      throw new UsageError('--size-profile does not apply to this migration: it is chunked uniformly (--chunk-files); --concurrency changes the objects copied at once.');
+    }
+  } else if (opts.sizeClasses) {
+    sizeClasses = opts.sizeClasses;
+  } else if (opts.sizeProfile !== undefined) {
+    for (const [key, flag] of [['chunkFiles', '--chunk-files'], ['concurrency', '--concurrency']]) {
+      if (opts[key] !== undefined) throw new UsageError(`${flag} cannot be used with --size-profile: set "${key}" for each class in the profile.`);
+    }
+    sizeClasses = profile();
+  } else if (opts.chunkFiles === undefined && opts.concurrency === undefined) {
+    sizeClasses = DEFAULT_SIZE_CLASSES.map((c) => ({ ...c }));
+  }
+  const options = {
+    ...(sizeClasses ? {} : { chunkFiles: pick('chunkFiles', '--chunk-files', parseCount) }),
     chunkBytes: pick('chunkBytes', '--chunk-bytes', parseSize),
     chunkMinutes: pick('chunkMinutes', '--chunk-minutes', parseCount),
     parallel: pick('parallel', '--parallel', parseCount),
-    concurrency: pick('concurrency', '--concurrency', parseCount),
+    ...(sizeClasses ? {} : { concurrency: pick('concurrency', '--concurrency', parseCount) }),
     blockSize: pick('blockSize', '--block-size', parseSize),
     maxAttempts: pick('maxAttempts', '--max-attempts', parseCount),
+    ...(sizeClasses ? { sizeClasses } : {}),
   };
+  return { options, warnings };
 }
+
+/**
+ * The classes of a migration being continued, with the `concurrency` of the class of the same name in `profile`.
+ * Anything else that differs is not applied (chunks already exist): it is added to `warnings`.
+ */
+function changedConcurrency(classes, profile, warnings) {
+  const byName = new Map(profile.map((c) => [c.name, c]));
+  const names = new Set(classes.map((c) => c.name));
+  const result = classes.map((c) => {
+    const p = byName.get(c.name);
+    if (!p) {
+      warnings.push(`--size-profile has no class "${c.name}": its concurrency stays ${c.concurrency}.`);
+      return c;
+    }
+    const changed = ['below', 'chunkFiles', 'chunkBytes'].filter((k) => p[k] !== c[k]);
+    if (changed.length > 0) warnings.push(`--size-profile changes ${changed.join(', ')} of class "${c.name}": ignored, since its chunks already exist; only "concurrency" is applied.`);
+    return { ...c, concurrency: p.concurrency };
+  });
+  for (const p of profile) if (!names.has(p.name)) warnings.push(`--size-profile class "${p.name}" is not a class of this migration: ignored.`);
+  return result;
+}
+
+/** The objects copied at once in a chunk: those of its size class, or of a uniform migration. */
+const concurrencyOf = (options, chunk) => options.sizeClasses?.find((c) => c.name === chunk.sizeClass)?.concurrency ?? options.concurrency ?? MIGRATION_DEFAULTS.concurrency;
+
+/** The most objects copied at once in one chunk. */
+const maxConcurrency = (options) => (options.sizeClasses ? Math.max(...options.sizeClasses.map((c) => c.concurrency)) : options.concurrency);
+
+/** The classes of the chunk writer: the size classes, or one class without a name for uniform chunks. */
+const writerClasses = (options) => options.sizeClasses ?? [{ chunkFiles: options.chunkFiles }];
 
 function parseStopAfter(value) {
   if (value !== undefined && !STOP_AFTER.includes(value)) throw new UsageError(`Invalid --stop-after "${value}": use ${STOP_AFTER.join(' or ')} (list into chunks and analyse, copy nothing).`);
@@ -272,7 +339,7 @@ function nextDeltaOptions(opts, previous, round) {
   const { m, options, dir } = previous;
   return {
     ...opts,
-    ...options, // chunkFiles, chunkBytes, chunkMinutes, parallel, concurrency, blockSize, maxAttempts (as the previous round ran them)
+    ...options, // sizeClasses or chunkFiles and concurrency, chunkBytes, chunkMinutes, parallel, blockSize, maxAttempts (as the previous round ran them)
     migration: undefined,
     view: undefined,
     lastCopyDate: undefined,
@@ -331,6 +398,7 @@ async function runOneMigration(opts, out) {
   let m;
   let target;
   let options;
+  let warnings;
   if (continuing) {
     dir = await resolveMigrationDir(opts, out);
     m = readMigration(dir);
@@ -339,11 +407,11 @@ async function runOneMigration(opts, out) {
     }
     target = readTarget(opts, redactor, out);
     if (target.base !== m.targetBase) throw new UsageError(`Target ${target.base} does not match the migration's target ${m.targetBase}.`);
-    options = parseOptions({ parallel: opts.parallel, concurrency: opts.concurrency, maxAttempts: opts.maxAttempts }, m.options);
+    ({ options, warnings } = parseOptions({ parallel: opts.parallel, concurrency: opts.concurrency, maxAttempts: opts.maxAttempts, sizeProfile: opts.sizeProfile }, m.options));
   } else {
     const { bucket, prefix } = resolveSource(opts);
     target = readTarget(opts, redactor, out);
-    options = parseOptions(opts);
+    ({ options, warnings } = parseOptions(opts));
     const startedAt = new Date();
     const sourceBase = buildSourceUrl(bucket, prefix, opts.sourceRegion);
     const destBase = buildTargetBase(target, prefix);
@@ -370,7 +438,7 @@ async function runOneMigration(opts, out) {
       carried,
       overwriteModified: Boolean(opts.overwriteModified),
       options,
-      inventory: { status: 'pending', resumeAfter: null, files: 0, bytes: 0, skipped: 0, archived: 0, skippedFileBytes: 0 },
+      inventory: { status: 'pending', listedThrough: null, ...(options.sizeClasses ? { closedThrough: {} } : {}), resumeAfter: null, files: 0, bytes: 0, skipped: 0, archived: 0, skippedFileBytes: 0 },
       chunks: [],
     };
   }
@@ -380,11 +448,12 @@ async function runOneMigration(opts, out) {
   const chunksDir = path.join(dir, 'chunks');
 
   if (opts.dryRun) {
+    for (const w of warnings) out.write(`Warning: ${w}\n`);
     printDryRun({ out, m, dir, options, continuing, stopAfter });
     return { code: EXIT.OK, outcome: 'dry-run', dir, m, options, inventoryFiles: 0 };
   }
   requireAwsCredentials(redactor);
-  const s3 = await withS3(opts, { bucket: m.bucket, region: m.region || undefined, maxSockets: options.parallel * options.concurrency + 8 }, stopAfter ? ['listPage'] : undefined);
+  const s3 = await withS3(opts, { bucket: m.bucket, region: m.region || undefined, maxSockets: options.parallel * maxConcurrency(options) + 8 }, stopAfter ? ['listPage'] : undefined);
   const { container, directory } = stopAfter ? {} : opts.container ? { container: opts.container, directory: targetDirectory(target) } : await containerFor(target);
 
   fs.mkdirSync(dir, { recursive: true });
@@ -455,6 +524,11 @@ async function runOneMigration(opts, out) {
     view.start?.({ dir, logFile, migration: m });
     log('INFO', `${continuing ? 'continuing' : 'starting'} migration ${dir}`);
     log('INFO', `options: ${JSON.stringify(options)}`);
+    if (options.sizeClasses) sizeClassLines(options.sizeClasses).forEach((l) => log('INFO', `size class ${l}`));
+    for (const w of warnings) {
+      log('WARN', w);
+      view.message?.('WARN', w);
+    }
     if (s3.region) log('INFO', `source region: ${s3.region}`);
     for (const [label, text] of deltaLines(m)) log('INFO', `${label.toLowerCase()}: ${text}`);
     m.outcome = 'running';
@@ -465,7 +539,7 @@ async function runOneMigration(opts, out) {
     // ---- the carried files of a delta: the first chunks, written before the listing starts
     if (m.carried && m.carried.chunks === undefined) {
       const paths = collectCarried(m.baseline.dir)?.paths ?? new Map();
-      const chunks = writeCarriedChunks({ carried: paths, chunksDir, maxFiles: options.chunkFiles, dir });
+      const chunks = writeCarriedChunks({ carried: paths, chunksDir, classes: writerClasses(options), dir });
       m.chunks = chunks.map(newEntry);
       m.carried.chunks = chunks.length;
       log('INFO', `${chunks.length} carried-over chunk(s), ${paths.size} file(s)`);
@@ -506,30 +580,33 @@ async function runOneMigration(opts, out) {
     const listing = async () => {
       const exclude = new Set(m.chunks.filter((c) => c.carried).flatMap((c) => readChunkRecords(path.join(dir, c.list)).map((r) => r.path)));
       const base = { files: inv.files ?? 0, bytes: inv.bytes ?? 0, skipped: inv.skipped ?? 0, archived: inv.archived ?? 0, excluded: inv.excluded ?? 0 };
+      // The counts of the closed chunks and of the keys skipped or excluded so far (what a stop keeps).
+      const counts = () => ({
+        files: base.files + writer.files,
+        bytes: base.bytes + writer.bytes,
+        skipped: base.skipped + writer.skipped,
+        archived: base.archived + writer.archived,
+        excluded: base.excluded + writer.excluded,
+        skippedFileBytes: writer.skippedBytes,
+      });
       const writer = new ChunkWriter({
         chunksDir,
         dir,
-        maxFiles: options.chunkFiles,
+        classes: writerClasses(options),
         maxBytes: options.chunkBytes,
         maxAgeMs: options.chunkMinutes * 60_000,
         now: opts.now ?? Date.now,
         nextId: m.chunks.reduce((max, c) => Math.max(max, c.id), 0) + 1,
         skippedBytes: inv.skippedFileBytes ?? 0,
         exclude,
-        onClosed: async (chunk, resumeAfter) => {
+        // A legacy inventory has resumeAfter alone: it is listedThrough and closedThrough of every class.
+        resume: { startAfter: inv.resumeAfter ?? null, listedThrough: inv.listedThrough ?? inv.resumeAfter ?? null, closedThrough: inv.closedThrough ?? null },
+        onClosed: async (chunk, { listedThrough, closedThrough, resumeAfter }) => {
           const entry = newEntry(chunk);
           m.chunks.push(entry);
-          Object.assign(inv, {
-            resumeAfter,
-            files: base.files + writer.files,
-            bytes: base.bytes + writer.bytes,
-            skipped: base.skipped + writer.skipped,
-            archived: base.archived + writer.archived,
-            excluded: base.excluded + writer.excluded,
-            skippedFileBytes: writer.skippedBytes,
-          });
-          save(); // with resumeAfter: a continued listing starts after this chunk
-          log('INFO', `chunk ${chunkId(chunk.id)} closed: ${chunk.files} objects, ${chunk.bytes} bytes`);
+          Object.assign(inv, { listedThrough, ...(options.sizeClasses ? { closedThrough } : {}), resumeAfter, ...counts() });
+          save(); // a continued listing starts after resumeAfter and leaves out what is recorded
+          log('INFO', `chunk ${chunkId(chunk.id)}${chunk.sizeClass ? ` (${chunk.sizeClass})` : ''} closed: ${chunk.files} objects, ${chunk.bytes} bytes`);
           view.chunkClosed?.(entry);
           if (!stopAfter) queue.push(entry);
           wake();
@@ -558,21 +635,21 @@ async function runOneMigration(opts, out) {
       try {
         await provider.list(async (record) => {
           await writer.add(record);
-          progress.listing.files = base.files + writer.files;
+          progress.listing.files = base.files + writer.listed;
           if (Date.now() - lastProgress >= PROGRESS_INTERVAL_MS) {
             lastProgress = Date.now();
-            view.inventoryProgress?.({ files: base.files + writer.files, bytes: base.bytes + writer.bytes, chunks: m.chunks.length });
+            view.inventoryProgress?.({ files: base.files + writer.listed, bytes: base.bytes + writer.listedBytes, chunks: m.chunks.length });
             changed();
           }
         });
         await writer.end();
-        Object.assign(inv, { status: 'done', finishedAt: new Date().toISOString(), seconds: (inv.seconds ?? 0) + Math.round((Date.now() - began) / 1000) });
+        Object.assign(inv, counts(), { status: 'done', finishedAt: new Date().toISOString(), seconds: (inv.seconds ?? 0) + Math.round((Date.now() - began) / 1000) });
         delete inv.error;
         if (m.carried) m.carried.inListing = inv.excluded ?? 0;
         save();
         log('INFO', `listing done: ${inv.files} objects, ${inv.bytes} bytes, ${m.chunks.length} chunk(s), ${inv.skipped} skipped key(s)`);
         fs.rmSync(summaryFile, { force: true });
-        view.chunking?.({ chunks: m.chunks, skipped: inv.skipped, archived: inv.archived, maxFiles: options.chunkFiles, maxBytes: options.chunkBytes, chunksDir });
+        view.chunking?.({ chunks: m.chunks, skipped: inv.skipped, archived: inv.archived, maxFiles: options.chunkFiles, maxBytes: options.chunkBytes, sizeClasses: options.sizeClasses, chunksDir });
       } catch (e) {
         await writer.abandon();
         if (e instanceof InventoryAborted) return;
@@ -606,7 +683,7 @@ async function runOneMigration(opts, out) {
     const copier = stopAfter ? null : createCopier({ s3, container, directory, prefix: m.prefix, blockSize: options.blockSize, overwriteModified: m.overwriteModified });
     const runChunk = async (chunk) => {
       const began = Date.now();
-      view.chunkStarted?.(chunk.id);
+      view.chunkStarted?.(chunk.id, chunk);
       log('INFO', `chunk ${chunkId(chunk.id)} started (status ${chunk.status}, attempts ${chunk.attempts})`);
       while (!abort.signal.aborted) {
         let records = readChunkRecords(path.join(dir, chunk.list));
@@ -633,7 +710,7 @@ async function runOneMigration(opts, out) {
         const chunkView = new ChunkView({ id: chunk.id, progress, view, changed });
         const report = await copyChunk({
           records,
-          concurrency: options.concurrency,
+          concurrency: concurrencyOf(options, chunk),
           signal: abort.signal,
           copy: copier,
           runDir,
@@ -690,8 +767,8 @@ async function runOneMigration(opts, out) {
     };
 
     if (!stopAfter) {
-      view.copyStarted?.({ chunks: queue.length, parallel: options.parallel, concurrency: options.concurrency });
-      log('INFO', `copying as the chunks close: ${queue.length} ready, ${options.parallel} chunk(s) at a time, ${options.concurrency} object(s) at once in each`);
+      view.copyStarted?.({ chunks: queue.length, parallel: options.parallel, concurrency: options.concurrency, sizeClasses: options.sizeClasses });
+      log('INFO', `copying as the chunks close: ${queue.length} ready, ${options.parallel} chunk(s) at a time, ${atOnceText(options)} in each`);
     }
     const listed = listingRuns ? listing().catch(fail) : Promise.resolve();
     await Promise.all([listed, ...(stopAfter ? [] : Array.from({ length: options.parallel }, worker))]);
@@ -727,11 +804,18 @@ async function runOneMigration(opts, out) {
   }
 }
 
+/** The size class table of a dry run, indented. */
+const classTable = (classes) => sizeClassLines(classes).map((l) => `       ${l}\n`).join('');
+
+/** The objects copied at once in a chunk, as a text. */
+const atOnceText = (options) => (options.sizeClasses ? `the objects at once of its size class (${concurrencyText(options.sizeClasses)})` : `${options.concurrency} object(s) at once`);
+
 function printDryRun({ out, m, dir, options, continuing, stopAfter }) {
   if (continuing) {
     const left = m.chunks.filter((c) => !isFinished(c)).length;
     const listing = m.inventory.status === 'done' ? 'done' : m.inventory.resumeAfter ? 'continued after the last closed chunk' : 'started again';
-    out.write(`\nDry run - would continue migration ${dir}\n  listing ${listing}, ${left} of ${m.chunks.length} chunk(s) to copy, ${options.parallel} at a time, ${options.concurrency} object(s) at once in each\n`);
+    out.write(`\nDry run - would continue migration ${dir}\n  listing ${listing}, ${left} of ${m.chunks.length} chunk(s) to copy, ${options.parallel} at a time, ${atOnceText(options)} in each\n`);
+    if (options.sizeClasses) out.write(classTable(options.sizeClasses));
     return;
   }
   out.write(
@@ -740,10 +824,13 @@ function printDryRun({ out, m, dir, options, continuing, stopAfter }) {
       `  Mode:    ${m.includeAfter ? `delta (objects modified on/after ${m.includeAfter})` : 'full (everything not already at the target)'}${m.overwriteModified ? ', blobs older than their object are written again' : ', append-only'}\n` +
       deltaLines(m).slice(m.baseline ? 0 : 1).map(([label, text]) => `  ${`${label}:`.padEnd(9)}${text}\n`).join('') +
       `  Folder:  ${dir}\n` +
-      `  1. List the source (S3 ListObjectsV2, 1,000 keys per page) into chunks of at most ${formatCount(options.chunkFiles)} objects or ${formatBytes(options.chunkBytes)}, closed after ${formatCount(options.chunkMinutes)} minute(s) at most\n` +
+      (options.sizeClasses
+        ? `  1. List the source (S3 ListObjectsV2, 1,000 keys per page) into chunks by size class, each of at most its files per chunk or ${formatBytes(options.chunkBytes)}, closed after ${formatCount(options.chunkMinutes)} minute(s) at most\n` +
+          classTable(options.sizeClasses)
+        : `  1. List the source (S3 ListObjectsV2, 1,000 keys per page) into chunks of at most ${formatCount(options.chunkFiles)} objects or ${formatBytes(options.chunkBytes)}, closed after ${formatCount(options.chunkMinutes)} minute(s) at most\n`) +
       (stopAfter
         ? '  2. Analyse the listing. Stops there: nothing is copied.\n'
-        : `  2. Copy each chunk as it closes: ${options.parallel} chunk(s) at once, ${options.concurrency} object(s) at once in each, up to ${options.maxAttempts} attempts per chunk\n` +
+        : `  2. Copy each chunk as it closes: ${options.parallel} chunk(s) at once, ${atOnceText(options)} in each, up to ${options.maxAttempts} attempts per chunk\n` +
           `     (Put Blob From URL from a presigned S3 URL; in blocks above ${formatBytes(options.blockSize)})\n` +
           '  3. Analyse the listing when it ends\n'),
   );

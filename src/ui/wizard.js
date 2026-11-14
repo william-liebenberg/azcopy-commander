@@ -3,6 +3,7 @@ import process from 'node:process';
 import * as baseCommands from '../commands.js';
 import * as migrationCommands from '../migration.js';
 import { parseCount, parseSize } from '../chunks.js';
+import { DEFAULT_SIZE_CLASSES, readSizeProfile, sizeClassLines } from '../size-classes.js';
 import { parseLastCopyDate } from '../dates.js';
 import { formatBytes, formatCount } from '../format.js';
 import { EXIT } from '../errors.js';
@@ -34,6 +35,7 @@ const PRESETS = {
   sourceRegion: { label: 'Region', check: (v) => buildSourceUrl('bucket', '', String(v).trim()) },
   overwriteModified: { label: 'Replace', check: () => {}, show: () => 'blobs older than the S3 object' },
   lastCopyDate: { label: 'Modified since', check: (v) => { if (String(v).trim() !== 'auto') parseLastCopyDate(v); } },
+  sizeProfile: { label: 'Size profile', check: (v) => readSizeProfile(path.resolve(String(v).trim())) },
   chunkFiles: { label: 'Chunk objects', check: (v) => parseCount(String(v).trim(), 'the number of objects') },
   chunkBytes: { label: 'Chunk size', check: (v) => parseSize(String(v).trim(), 'the chunk size') },
   chunkMinutes: { label: 'Chunk minutes', check: (v) => parseCount(String(v).trim(), 'the number of minutes') },
@@ -274,7 +276,7 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
    */
   async function migrateFlow({ delta = false } = {}) {
     const cli = await commandLine([
-      'sourceBucket', 'sourcePrefix', 'sourceRegion', 'overwriteModified', ...(delta ? ['lastCopyDate'] : []), 'chunkFiles', 'chunkBytes', 'chunkMinutes',
+      'sourceBucket', 'sourcePrefix', 'sourceRegion', 'overwriteModified', ...(delta ? ['lastCopyDate'] : []), 'sizeProfile', 'chunkFiles', 'chunkBytes', 'chunkMinutes',
       'parallel', 'concurrency', 'blockSize', 'maxAttempts', 'stopAfter', 'repeat', 'repeatUntil', 'repeatMax',
     ]);
     await askAws();
@@ -319,7 +321,34 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       initialValue: cli.found('overwriteModified') || (baseline?.overwriteModified ?? false),
     }));
     const text = async (key, options) => (cli.has(key) ? String(cli.get(key)) : await ask(prompts.text({ ...options, initialValue: cli.initial(key, options.initialValue) }))).trim();
-    const chunkFiles = await text('chunkFiles', {
+    // Size classes (each with its own files per chunk and objects at once), or uniform chunks as --chunk-files does.
+    const uniformGiven = cli.found('chunkFiles') || cli.found('concurrency');
+    const chunking = cli.has('sizeProfile') ? 'profile' : cli.has('chunkFiles') || cli.has('concurrency') ? 'uniform' : await ask(prompts.select({
+      message: 'How should the listing be cut into chunks?',
+      initialValue: cli.found('sizeProfile') ? 'profile' : uniformGiven ? 'uniform' : 'classes',
+      options: [
+        { value: 'classes', label: 'By size class (defaults)', hint: 'small and large objects in chunks of their own, each copied its own way' },
+        { value: 'profile', label: 'By size class, from a profile file', hint: '--size-profile' },
+        { value: 'uniform', label: 'Uniform chunks', hint: 'one number of objects per chunk and at once for all' },
+      ],
+    }));
+    let sizeProfile;
+    let sizeClasses = null;
+    if (chunking === 'profile') {
+      sizeProfile = await text('sizeProfile', {
+        message: 'Size profile file (JSON, see the README)',
+        initialValue: '',
+        validate: validation((v) => readSizeProfile(path.resolve(v.trim()))),
+      });
+      sizeClasses = readSizeProfile(path.resolve(sizeProfile));
+    } else if (chunking === 'classes') {
+      sizeClasses = DEFAULT_SIZE_CLASSES;
+    }
+    if (sizeClasses) {
+      if (uniformGiven) prompts.log.warn('--chunk-files and --concurrency are not used with size classes: each class has its own.');
+      prompts.note(sizeClassLines(sizeClasses).join('\n'), sizeProfile ? `Size classes (${sizeProfile})` : 'Size classes');
+    }
+    const chunkFiles = sizeClasses ? undefined : await text('chunkFiles', {
       message: 'Most objects in a chunk',
       initialValue: String(MIGRATION_DEFAULTS.chunkFiles),
       validate: validation((v) => parseCount(v.trim(), 'the number of objects')),
@@ -334,7 +363,7 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       initialValue: String(MIGRATION_DEFAULTS.parallel),
       validate: validation((v) => parseCount(v.trim(), 'the number of chunks')),
     });
-    const concurrency = await text('concurrency', {
+    const concurrency = sizeClasses ? undefined : await text('concurrency', {
       message: 'Objects copied at once in each chunk',
       initialValue: String(MIGRATION_DEFAULTS.concurrency),
       validate: validation((v) => parseCount(v.trim(), 'the number of objects')),
@@ -369,8 +398,8 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       ['Target', buildTargetBase(target, source.prefix)],
       ['Mode', delta ? `delta, objects modified ${sinceText}` : 'full, everything not already at the target'],
       ...(carried ? [['Carried', carried.files > 0 ? `${formatCount(carried.files)} file(s) it did not copy, from ${formatCount(carried.fromChunks.length)} chunk(s), ${formatBytes(carried.bytes)}` : 'nothing (it copied everything)']] : []),
-      ['Chunks', `at most ${chunkFiles} objects or ${chunkBytes} each, closed after ${passed.chunkMinutes ?? MIGRATION_DEFAULTS.chunkMinutes} min`],
-      ['Copy', `as the chunks close: ${parallel} chunk(s) at once, ${concurrency} object(s) at once in each${passed.maxAttempts ? `, ${passed.maxAttempts} attempts per chunk` : ''}`],
+      ['Chunks', `${sizeClasses ? `by size class${sizeProfile ? ` (${sizeProfile})` : ' (defaults)'}, each at most its files per chunk or ${chunkBytes}` : `at most ${chunkFiles} objects or ${chunkBytes} each`}, closed after ${passed.chunkMinutes ?? MIGRATION_DEFAULTS.chunkMinutes} min`],
+      ['Copy', `as the chunks close: ${parallel} chunk(s) at once, ${sizeClasses ? 'the objects at once of its size class' : `${concurrency} object(s) at once`} in each${passed.maxAttempts ? `, ${passed.maxAttempts} attempts per chunk` : ''}`],
       ...(passed.stopAfter ? [['Stops', 'after the listing and the analysis: nothing is copied']] : []),
       ...(repeat ? [['Repeat', `until ≤ ${formatCount(Number(repeatUntil))} objects, at most ${formatCount(Number(passed.repeatMax ?? REPEAT_DEFAULTS.max))} deltas`]] : []),
       ['Replace', overwriteModified ? 'blobs older than the S3 object' : 'never (append-only)'],
@@ -388,10 +417,11 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       sourcePrefix: source.prefix,
       sourceRegion: source.region || undefined,
       overwriteModified,
-      chunkFiles,
+      ...(sizeClasses ? {} : { chunkFiles }),
+      ...(sizeProfile ? { sizeProfile } : {}),
       chunkBytes,
       parallel,
-      concurrency,
+      ...(sizeClasses ? {} : { concurrency }),
       ...(lastCopyDate ? { lastCopyDate } : {}),
       ...(baseline ? { baselineDir: baseline.dir } : {}),
       ...(repeat ? { repeat: true, repeatUntil } : {}),
@@ -408,8 +438,9 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       prompts.log.warn(`No unfinished migration in ${shown(path.resolve(baseOpts.outputDir ?? 'runs'))}${old}.`);
       return undefined;
     }
-    const cli = await commandLine(['parallel', 'concurrency', 'maxAttempts'], { askToUse: false }); // the ones that can change when continuing
-    const changes = cli.extra(['parallel', 'concurrency', 'maxAttempts']);
+    // The ones that can change when continuing (--size-profile: the concurrency of each class).
+    const cli = await commandLine(['parallel', 'concurrency', 'sizeProfile', 'maxAttempts'], { askToUse: false });
+    const changes = cli.extra(['parallel', 'concurrency', 'sizeProfile', 'maxAttempts']);
     await askAws();
     await askSas();
     const target = parseTargetSasUrl(secrets.sas.url);
