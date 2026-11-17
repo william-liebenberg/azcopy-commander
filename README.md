@@ -73,6 +73,7 @@ A chunk is closed when it holds the files per chunk of its class, when the next 
 | Option | Meaning |
 |---|---|
 | `--size-profile <file>` | The size classes, from a JSON file (see [Size classes](#size-classes)). Without it, and without `--chunk-files` and `--concurrency`, the default classes are used. |
+| `--generate-size-profile <file>` | Used alone, without a command: write the default size classes to `<file>`, to edit and use with `--size-profile`. Never replaces a file that exists. |
 | `--chunk-files <n>` | Uniform chunks: most objects per chunk (default 100000) |
 | `--chunk-bytes <size>` | Most bytes per chunk, e.g. `500GiB`, `2TiB` or a plain number (default 1TiB) |
 | `--chunk-minutes <n>` | Close a chunk that has objects after n minutes (default 15) |
@@ -101,6 +102,8 @@ Also accepted: `--source-prefix`, `--source-region`, `--last-copy-date`, `--over
 | `very-large` | ≥ 100 GiB | 50 | 2 |
 
 An object above `--block-size` is already copied 8 blocks at a time, so the large classes need few objects at once. `--chunk-bytes` and `--chunk-minutes` apply to every class; a class may have its own `chunkBytes`. A profile file replaces the whole list: 1 to 10 classes, names of lower-case letters, digits and dashes, `below` growing from one class to the next, the last class without one; sizes are numbers of bytes or texts such as `64MiB`.
+
+Start from the defaults with `azcopy-commander --generate-size-profile profile.json`: it writes them to `profile.json` (one class per line, sizes such as `"64MiB"`; unchanged, the file behaves like no profile), prints the class table and the `--size-profile` command that uses it, and refuses a file that exists. JSON has no comments: add `chunkBytes` to a class to give it its own limit. For example:
 
 ```json
 {

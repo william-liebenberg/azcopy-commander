@@ -1,5 +1,7 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { UsageError } from './errors.js';
+import { writeFileAtomic } from './files.js';
 import { formatBytes, formatCount } from './format.js';
 import { parseCount, parseSize } from './chunks.js';
 
@@ -72,6 +74,50 @@ export function readSizeProfile(file) {
     if (!(c.below > before.below)) throw bad(`"below" must grow from one class to the next: "${c.name}" (${sizeText(c.below)}) is not above "${before.name}" (${sizeText(before.below)})`);
   }
   return classes;
+}
+
+const PROFILE_UNITS = [['PiB', 2 ** 50], ['TiB', 2 ** 40], ['GiB', GiB], ['MiB', MiB], ['KiB', 2 ** 10]];
+
+/** A size for a profile file, in the largest binary unit that divides it exactly: "64MiB", "1500" (parseSize reads it back). */
+const profileSize = (bytes) => {
+  const [unit, size] = PROFILE_UNITS.find(([, s]) => bytes % s === 0) ?? ['', 1];
+  return `${bytes / size}${unit}`;
+};
+
+/** The text of a size profile file of `classes` (sizes in bytes), one class per line, readable by readSizeProfile. */
+export function sizeProfileText(classes) {
+  const line = (c) => {
+    const entries = [
+      ['name', c.name],
+      ...(c.below === undefined ? [] : [['below', profileSize(c.below)]]),
+      ['chunkFiles', c.chunkFiles],
+      ['concurrency', c.concurrency],
+      ...(c.chunkBytes === undefined ? [] : [['chunkBytes', profileSize(c.chunkBytes)]]),
+    ];
+    return `    { ${entries.map(([k, v]) => `${JSON.stringify(k)}: ${JSON.stringify(v)}`).join(', ')} }`;
+  };
+  return `{\n  "classes": [\n${classes.map(line).join(',\n')}\n  ]\n}\n`;
+}
+
+/**
+ * Writes the default size classes to `file` (--generate-size-profile), to be edited and used with --size-profile, and
+ * tells how. Never replaces a file: one that exists is a UsageError. Creates the parent folder if needed.
+ */
+export function writeSizeProfile(file, out = process.stdout) {
+  const target = path.resolve(file);
+  if (fs.existsSync(target)) throw new UsageError(`${target} already exists: remove it or choose another file.`);
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    writeFileAtomic(target, sizeProfileText(DEFAULT_SIZE_CLASSES));
+  } catch (e) {
+    throw new UsageError(`Cannot write the size profile ${target}: ${e.message}.`);
+  }
+  out.write([
+    `Wrote ${target}: the default size classes.`,
+    ...sizeClassLines(DEFAULT_SIZE_CLASSES).map((l) => `  ${l}`),
+    'Edit it (a class may also have "chunkBytes"; see README, Size classes), then use it with:',
+    `  azcopy-commander migrate --source-bucket <bucket> --size-profile "${target}"`,
+  ].map((l) => `${l}\n`).join(''));
 }
 
 /** The class of an object of `size` bytes: the first whose `below` is above it, else the last. */

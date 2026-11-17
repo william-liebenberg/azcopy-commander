@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { ChunkWriter, writeCarriedChunks, readChunkRecords } from '../src/chunks.js';
-import { classOf, compareKeys, DEFAULT_SIZE_CLASSES, readSizeProfile } from '../src/size-classes.js';
+import { classOf, compareKeys, DEFAULT_SIZE_CLASSES, readSizeProfile, sizeProfileText, writeSizeProfile } from '../src/size-classes.js';
 import { UsageError } from '../src/errors.js';
 import { analyseInventory, analysisLines, s3Provider } from '../src/inventory.js';
 import { MigrationProgress, formatAggregate } from '../src/migration-view.js';
@@ -196,6 +198,51 @@ test('size classes: the defaults, the class of a size (`below` is the next class
   assert.throws(bad([{ ...last, concurrency: 'many' }]), /Invalid "concurrency" of class 1/);
   assert.throws(bad([{ ...last, name: 'a', below: 'lots' }, last]), /Invalid "below" of class 1/);
   assert.throws(bad([{ ...last, parallel: 3 }]), /unknown setting\(s\) parallel/);
+});
+
+test('size classes: --generate-size-profile writes the defaults as a readable profile, never over a file', () => {
+  const dir = tmp('genprofile');
+  const file = path.join(dir, 'new', 'profile.json'); // the folder "new" does not exist yet
+  const out = sink();
+  writeSizeProfile(file, out);
+  assert.deepEqual(readSizeProfile(file), DEFAULT_SIZE_CLASSES.map((c) => ({ ...c })));
+  const text = fs.readFileSync(file, 'utf8');
+  assert.match(text, /\{ "name": "small", "below": "64MiB", "chunkFiles": 50000, "concurrency": 64 \}/);
+  assert.match(text, /\{ "name": "very-large", "chunkFiles": 50, "concurrency": 2 \}\n  \]\n\}\n$/);
+  assert.ok(out.text().startsWith(`Wrote ${file}: the default size classes.\n`), out.text());
+  assert.match(out.text(), /\n {2}small +1 MiB – < 64 MiB +50,000 files per chunk, 64 at once\n/);
+  assert.ok(out.text().includes(`azcopy-commander migrate --source-bucket <bucket> --size-profile "${file}"\n`));
+
+  // a size that is not a whole unit, and chunkBytes, read back to the same bytes
+  const odd = [{ name: 'odd', below: 1500, chunkFiles: 7, concurrency: 3, chunkBytes: 3 * 2 ** 40 }, { name: 'rest', chunkFiles: 1, concurrency: 1 }];
+  const oddText = sizeProfileText(odd);
+  assert.match(oddText, /"below": "1500", .*"chunkBytes": "3TiB"/);
+  const oddFile = path.join(dir, 'odd.json');
+  fs.writeFileSync(oddFile, oddText);
+  assert.deepEqual(readSizeProfile(oddFile), odd);
+
+  // an existing file is refused and left as it is
+  fs.writeFileSync(file, 'edited');
+  assert.throws(() => writeSizeProfile(file, sink()), (e) => e instanceof UsageError && e.message === `${file} already exists: remove it or choose another file.`);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'edited');
+});
+
+test('size classes: the CLI writes a profile with --generate-size-profile alone, and refuses it with a command', () => {
+  const bin = fileURLToPath(new URL('../bin/azcopy-commander.js', import.meta.url));
+  const file = path.join(tmp('genprofile-cli'), 'profile.json');
+  const run = (...args) => spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8' });
+  const ok = run('--generate-size-profile', file);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.deepEqual(readSizeProfile(file), DEFAULT_SIZE_CLASSES.map((c) => ({ ...c })));
+  assert.match(ok.stdout, /--size-profile/);
+  const again = run('--generate-size-profile', file);
+  assert.equal(again.status, 64);
+  assert.match(again.stderr, /already exists/);
+  const other = path.join(path.dirname(file), 'other.json');
+  const withCommand = run('migrate', '--generate-size-profile', other);
+  assert.equal(withCommand.status, 64);
+  assert.match(withCommand.stderr, /--generate-size-profile is used alone, without migrate/);
+  assert.equal(fs.existsSync(other), false);
 });
 
 test('ChunkWriter by size class: each object in the chunk of its class; each class closes at its own files, bytes and age', async () => {

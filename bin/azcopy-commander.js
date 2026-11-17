@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util';
 import { listCommand, UsageError } from '../src/commands.js';
 import { EXIT } from '../src/errors.js';
 import { migrateCommand } from '../src/migration.js';
+import { writeSizeProfile } from '../src/size-classes.js';
 import { runUi } from '../src/ui/index.js';
 
 const HELP = `azcopy-commander - append-only S3 -> Azure Blob migration, server-side with the Azure SDK
@@ -14,6 +15,8 @@ Usage:
   azcopy-commander migrate [--migration <dir>] --target-sas-url <url>                  continue one
   azcopy-commander list    --source-bucket <bucket> [--source-prefix <p>] [--source-region <r>] [--last-copy-date <d>]
                                                                     print the objects of the source (saves nothing)
+  azcopy-commander --generate-size-profile <file>                    write the default size classes to <file>, to edit
+                                                                    and use with --size-profile (used alone)
 
 The ui command asks for the bucket (name or ARN), the AWS keys and the SAS URL (hidden input, or taken from the
 environment), lets you pick an earlier migration for a delta or to continue it, then runs the same commands. Secrets
@@ -41,7 +44,8 @@ so it can be stopped (Ctrl+C) and continued: the listing starts again after the 
   --size-profile <file>       Size classes from a JSON file (see README): each object goes to the chunk of its size
                               class, each class with its own files per chunk and objects at once. Without it, and
                               without --chunk-files and --concurrency, the default classes are used
-                              (< 1 MiB, < 64 MiB, < 1 GiB, < 100 GiB, larger).
+                              (< 1 MiB, < 64 MiB, < 1 GiB, < 100 GiB, larger). Start a file from the defaults with
+                              azcopy-commander --generate-size-profile <file>.
   --chunk-files <n>           Uniform chunks: most objects per chunk (default 100000)
   --chunk-bytes <size>        Most bytes per chunk, e.g. 500GiB or 2TiB (default 1TiB)
   --chunk-minutes <n>         Close a chunk that has objects after n minutes (default 15), so a delta copies early
@@ -78,6 +82,7 @@ const options = {
   'output-dir': { type: 'string' },
   'dry-run': { type: 'boolean' },
   'size-profile': { type: 'string' },
+  'generate-size-profile': { type: 'string' },
   'chunk-files': { type: 'string' },
   'chunk-bytes': { type: 'string' },
   'chunk-minutes': { type: 'string' },
@@ -109,6 +114,24 @@ async function main() {
   if (parsed.values.help) {
     process.stdout.write(HELP);
     return EXIT.OK;
+  }
+  const profileFile = parsed.values['generate-size-profile'];
+  if (profileFile !== undefined) {
+    // Used alone, so that nobody believes a migration started with it.
+    const others = [...parsed.positionals, ...Object.keys(parsed.values).filter((k) => k !== 'generate-size-profile').map((k) => `--${k}`)];
+    const problem = others.length > 0 ? `--generate-size-profile is used alone, without ${others.join(' ')}: it only writes the file.` : !profileFile.trim() ? '--generate-size-profile needs a file name.' : undefined;
+    if (problem) {
+      process.stderr.write(`Error: ${problem}\n`);
+      return EXIT.USAGE;
+    }
+    try {
+      writeSizeProfile(profileFile);
+      return EXIT.OK;
+    } catch (err) {
+      if (!(err instanceof UsageError)) throw err;
+      process.stderr.write(`Error: ${err.message}\n`);
+      return EXIT.USAGE;
+    }
   }
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
   if (name === 'ui' || (!name && interactive)) {
