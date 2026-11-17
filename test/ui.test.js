@@ -10,6 +10,8 @@ import { colorEnabled, createStyle, unicodeSupported, visible } from '../src/ui/
 import * as realCommands from '../src/commands.js';
 import * as realMigration from '../src/migration.js';
 import { MigrationDashboard, renderMigrationDashboard } from '../src/ui/migration-dashboard.js';
+import { renderMigrationScreen } from '../src/ui/migration-screen.js';
+import { DEFAULT_SIZE_CLASSES } from '../src/size-classes.js';
 import { fakeContainer, fakeS3, PRESIGN_SECRET } from './fakes.js';
 
 const SAS = 'https://acct.blob.core.windows.net/cont?sv=2022-11-02&sp=racwl&se=2099-01-01T00:00:00Z&sig=SECRETSIG123';
@@ -628,12 +630,13 @@ test('wizard: the continue list shows whether a migration is full or delta', asy
 // ------------------------------------------------------------- the migration dashboard
 
 /** A terminal stand-in that records each write. */
-function fakeTerminal(columns = 100) {
+function fakeTerminal(columns = 100, rows = 30) {
   const writes = [];
   const listeners = {};
   return {
     isTTY: true,
     columns,
+    rows,
     writes,
     listeners,
     write: (chunk) => { writes.push(String(chunk)); return true; },
@@ -645,76 +648,51 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 const SYNC = '\x1b[?2026h';
 const unsync = (write) => write.replace(SYNC, '').replace('\x1b[?2026l', '');
 const plain = (lines) => lines.join('\n');
-/** The number of lines of the last block painted in a write (a write can hold several paints of one tick). */
-const lastHeight = (write) => {
-  const at = write.lastIndexOf('\x1b[J');
-  return (at < 0 ? write : write.slice(at + 3)).split('\n').length - 1;
-};
+const ENTER = '\x1b[?1049h\x1b[?25l';
+const LEAVE = '\x1b[?1049l\x1b[?25h';
+/** The rows of the last frame in a write, without colour. */
+const frameRows = (write) => visible(write.slice(write.lastIndexOf('\x1b[H') + 3).replace(/\x1b\[K\x1b\[J$/, '')).split('\r\n');
 
+const TiB = 2 ** 40;
 const AGGREGATE = {
   chunksTotal: 190, chunksDone: 42, chunksRunning: 4, chunksPending: 144, chunksExhausted: 1,
   running: [{ id: 13, percent: 71 }, { id: 14, percent: 18 }, { id: 15, percent: 52 }, { id: 16, percent: 2 }],
-  copied: 3012554, ignored: 0, failed: 3, bytesDone: 44.1 * 2 ** 40, bytesTotal: 184.2 * 2 ** 40, percent: 23.9, throughput: 1.62 * 2 ** 30, etaSeconds: 90720, elapsedSeconds: 600,
+  classes: [],
+  copied: 3012554, ignored: 0, missing: 0, failed: 3, bytesDone: 44.1 * TiB, bytesTotal: 184.2 * TiB, percent: 23.9, throughput: 1.62 * 2 ** 30,
+  averageThroughput: 1.4 * 2 ** 30, etaSeconds: 90720, elapsedSeconds: 600,
 };
 const LISTING = { ...AGGREGATE, listing: true, listed: 3_100_000, etaSeconds: NaN };
-const CLASSED = { ...AGGREGATE, running: AGGREGATE.running.map((c, i) => ({ ...c, sizeClass: ['very-small', 'small', 'large', 'very-large'][i] })) };
 const MIG_STATE = {
   title: 'Migrating  my-bucket → files3', phase: 'copying', frame: 2, elapsedSeconds: 134, snapshot: AGGREGATE, parallel: 10,
-  speeds: [1, 2, 3, 4, 5, 6, 5, 6], failures: [{ id: 9, path: 'data/2024/big file.bin', code: 'AuthorizationFailure' }], logFile: 'runs\\m\\migration.log', output: [],
+  speeds: [1, 2, 3, 4, 5, 6, 5, 6], logFile: 'runs\\m\\migration.log',
 };
 const MIG_RESULT = {
   outcome: 'partial', dir: 'runs\\m', maxAttempts: 5, chunksTotal: 190, chunksSuccess: 188, chunksExhausted: 2, chunksOpen: 0, copied: 12480000, ignored: 5, missing: 0, failed: 113,
-  bytesCopied: 184 * 2 ** 40, elapsedSeconds: 90000, skipped: 3, archived: 1, skippedFile: 'runs\\m\\chunks\\skipped.jsonl', files: { log: 'runs\\m\\migration.log', migration: 'runs\\m\\migration.json' },
+  bytesCopied: 184 * TiB, elapsedSeconds: 90000, skipped: 3, archived: 1, skippedFile: 'runs\\m\\chunks\\skipped.jsonl', files: { log: 'runs\\m\\migration.log', migration: 'runs\\m\\migration.json' },
 };
 
-test('renderMigrationDashboard: the copy phase shows the bar, ETA, chunk counters, running chunks, failures and log', () => {
-  const text = plain(renderMigrationDashboard(MIG_STATE, { columns: 120 }));
-  for (const part of [
-    'Migrating  my-bucket → files3', '23.9%', '44.10 TiB / 184.20 TiB', 'speed 1.62 GiB/s', 'ETA 1d 1h 12m', 'elapsed 2m 14s',
-    'chunks ✔ 42  ▶ 4  144 pending  ✖ 1', 'copied 3,012,554', '✖ failed 3',
-    '▶ 00013', '71%', '▶ 00016', '✖ AuthorizationFailure  data/2024/big file.bin   (chunk 00009)', 'log  runs\\m\\migration.log', '▂',
-  ]) assert.ok(text.includes(part), `missing "${part}" in\n${text}`);
-  assert.ok(!text.includes('\x1b') && !text.includes('listing'));
-  const many = { ...AGGREGATE, chunksRunning: 40, running: Array.from({ length: 40 }, (_, i) => ({ id: i + 1, percent: i })) };
-  const crowded = plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: many }, { columns: 120 }));
-  assert.match(crowded, /\+\d+ more running/);
-  assert.ok(renderMigrationDashboard({ ...MIG_STATE, snapshot: many }, { columns: 120 }).length < 20);
+test('renderMigrationDashboard: the compact lines of the copy, the listing, the inventory and the analysis', () => {
+  const text = plain(renderMigrationDashboard(MIG_STATE, { columns: 50 }));
+  for (const part of ['Migrating', '2m 14s', '23.9%', '1.62 GiB/s · ETA 1d 1h 12m', '✔ 42/190 ▶ 4 ✖ 3']) assert.ok(text.includes(part), `missing "${part}" in\n${text}`);
+  assert.equal(renderMigrationDashboard(MIG_STATE, { columns: 50 }).length, 4);
 
-  // a chunk of a size class shows the class next to its id, the cells keep their columns
-  const classes = plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: CLASSED }, { columns: 120 }));
-  assert.match(classes, /▶ 00013 very-small █+░* +71%/);
-  assert.match(classes, /▶ 00014 small {6}█*░+ +18%/);
-});
-
-test('renderMigrationDashboard: while the listing runs the copy has a listing line, a total with a + and no ETA', () => {
-  const text = plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: LISTING }, { columns: 120 }));
-  for (const part of ['listing ', '3,100,000 objects listed · 190 chunk(s) so far', '44.10 TiB / 184.20 TiB+', 'ETA after listing']) {
-    assert.ok(text.includes(part), `missing "${part}" in\n${text}`);
-  }
-  assert.ok(!text.includes('23.9%'), 'no percentage of a total still growing');
-  const narrow = plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: LISTING }, { columns: 50 }));
-  assert.ok(narrow.includes('listing 3,100,000 · 190 chunks') && narrow.includes('ETA after listing'), narrow);
+  const listing = plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: LISTING }, { columns: 50 }));
+  assert.ok(listing.includes('listing 3,100,000 · 190 chunks') && listing.includes('184.20 TiB+') && listing.includes('ETA after listing'), listing);
+  assert.ok(!listing.includes('23.9%'), 'no percentage of a total still growing');
   assert.deepEqual(renderMigrationDashboard({ ...MIG_STATE, snapshot: LISTING }, { columns: 30 }), ['+3,100,000 1.62GiB/s']);
-});
+  assert.deepEqual(renderMigrationDashboard(MIG_STATE, { columns: 30 }), ['23.9% 1.62GiB/s 1d1h']);
 
-test('renderMigrationDashboard: the inventory and analysis phases', () => {
-  const inventory = { title: 'Migrating', phase: 'inventory', provider: 'S3 ListObjectsV2', frame: 0, elapsedSeconds: 5, inventory: { files: 1234567, bytes: 3 * 2 ** 40 } };
-  const text = plain(renderMigrationDashboard(inventory, { columns: 100 }));
-  assert.ok(text.includes('Inventory (S3 ListObjectsV2)') && text.includes('1,234,567 objects · 3.00 TiB so far'), text);
-  assert.notEqual(text, plain(renderMigrationDashboard({ ...inventory, frame: 4 }, { columns: 100 })), 'the bar moves');
-
-  const analysis = { ...inventory, phase: 'analysis', analysis: ['12 objects, 1 KiB', 'WARNING: 2 archived object(s) cannot be copied'], chunkCount: undefined };
-  const a = plain(renderMigrationDashboard(analysis, { columns: 100 }));
-  assert.ok(a.includes('12 objects, 1 KiB') && a.includes('WARNING: 2 archived') && a.includes('analysing the listing'));
-  assert.ok(plain(renderMigrationDashboard({ ...analysis, chunkCount: 190 }, { columns: 100 })).includes('190 chunk(s) listed'));
-  assert.ok(plain(renderMigrationDashboard({ ...MIG_STATE, snapshot: null }, { columns: 100 })).includes('Migrating'), 'copy phase before the first progress');
+  const inventory = { title: 'Migrating', phase: 'inventory', frame: 0, elapsedSeconds: 5, inventory: { files: 1234567, bytes: 3 * TiB } };
+  const inv = plain(renderMigrationDashboard(inventory, { columns: 50 }));
+  assert.ok(inv.includes('Inventory') && inv.includes('1,234,567 objects · 3.00 TiB'), inv);
+  assert.notEqual(inv, plain(renderMigrationDashboard({ ...inventory, frame: 4 }, { columns: 50 })), 'the bar moves');
+  assert.ok(plain(renderMigrationDashboard({ ...inventory, phase: 'analysis' }, { columns: 50 })).includes('Analysis'));
 });
 
 test('renderMigrationDashboard: no line is wider than the terminal at any width, in any phase', () => {
   const states = [
     MIG_STATE,
     { ...MIG_STATE, snapshot: LISTING },
-    { ...MIG_STATE, snapshot: CLASSED },
     { ...MIG_STATE, snapshot: null },
     { ...MIG_STATE, phase: 'inventory', inventory: { files: 12, bytes: 99 } },
     { ...MIG_STATE, phase: 'analysis', analysis: ['x'.repeat(200)] },
@@ -731,11 +709,6 @@ test('renderMigrationDashboard: no line is wider than the terminal at any width,
       }
     }
   }
-  assert.deepEqual(renderMigrationDashboard(MIG_STATE, { columns: 30 }), ['23.9% 1.62GiB/s 1d1h']);
-  assert.equal(renderMigrationDashboard(MIG_STATE, { columns: 50 }).length, 4);
-  assert.ok(plain(renderMigrationDashboard(MIG_STATE, { columns: 50 })).includes('✔ 42/190'));
-  const ascii = plain(renderMigrationDashboard(MIG_STATE, { columns: 120, unicode: false }));
-  assert.ok(ascii.includes('> 00013') && !/[✔✖▶█░│]/.test(ascii));
 });
 
 test('renderMigrationDashboard: the result panel per outcome', () => {
@@ -755,31 +728,154 @@ test('renderMigrationDashboard: the result panel per outcome', () => {
   assert.deepEqual(renderMigrationDashboard({ result: MIG_RESULT }, { columns: 30 }), ['188/190 chunks · 113 failed']);
 });
 
+// ---- the full screen
+
+const SLOT = { state: 'running', attempt: 1 };
+const SCREEN_SNAPSHOT = {
+  ...LISTING,
+  running: [
+    { id: 13, sizeClass: 'very-small', percent: 71, filesDone: 71012, filesTotal: 100000, bytesDone: 612 * 2 ** 20, bytesTotal: 860 * 2 ** 20 },
+    { id: 14, sizeClass: 'small', percent: 18, filesDone: 9100, filesTotal: 50000, bytesDone: 410 * 2 ** 30, bytesTotal: TiB },
+    { id: 15, sizeClass: 'large', percent: 52, filesDone: 520, filesTotal: 1000, bytesDone: 1.4 * TiB, bytesTotal: 2.7 * TiB },
+  ],
+  chunksRunning: 3,
+  classes: [
+    { name: 'very-small', chunks: 120, done: 40, running: 1, pending: 79, exhausted: 0, files: 11_800_000, bytes: 3.1 * TiB, bytesDone: 0.97 * TiB },
+    { name: 'small', chunks: 50, done: 2, running: 1, pending: 47, exhausted: 0, files: 2_400_000, bytes: 48 * TiB, bytesDone: 2.4 * TiB },
+  ],
+};
+const SCREEN_STATE = {
+  ...MIG_STATE,
+  elapsedSeconds: 8040,
+  snapshot: SCREEN_SNAPSHOT,
+  parallel: 4,
+  errorCodes: [['AuthorizationFailure', 3]],
+  sizeClasses: DEFAULT_SIZE_CLASSES,
+  slots: [
+    { ...SLOT, ...SCREEN_SNAPSHOT.running[0], speed: 12.3 * 2 ** 20 },
+    { ...SLOT, ...SCREEN_SNAPSHOT.running[1], speed: 310 * 2 ** 20 },
+    { ...SLOT, ...SCREEN_SNAPSHOT.running[2], speed: 1.1 * 2 ** 30, attempt: 2 },
+    { id: 12, sizeClass: 'medium', state: 'ended', outcome: 'success', percent: 100, agoSeconds: 4, copied: 10000, failed: 0 },
+  ],
+  log: [
+    { time: 0, level: 'INFO', text: 'chunk 00041 (small) listed: 50,000 objects, 1.02 TiB' },
+    { time: 0, level: 'FAIL', text: 'chunk 00015  AuthorizationFailure  data/2024/big file.bin' },
+    { time: 0, level: 'WARN', text: 'chunk 00014: S3 SlowDown, retrying' },
+  ],
+};
+
+test('renderMigrationScreen: at 120 x 40 the header, the overall panel, the slots, the size classes and the log', () => {
+  const lines = renderMigrationScreen(SCREEN_STATE, { columns: 120, rows: 40 });
+  assert.equal(lines.length, 40);
+  const text = plain(lines);
+  for (const part of [
+    'Migrating  my-bucket → files3', 'elapsed 2h 14m',
+    'overall', '23.9%', '44.10 TiB / 184.20 TiB+', 'speed     1.62 GiB/s', 'average 1.40 GiB/s', 'ETA after listing',
+    'listing   3,100,000 objects listed · 190 chunks so far', 'copied 3,012,554 · ignored 0 · missing 0 · failed 3', 'errors AuthorizationFailure 3',
+    'chunks    ✔ 42 done · ▶ 3 running · 144 pending · ✖ 1 out of attempts',
+    '── Chunks being copied (4 workers) ──', '── Size classes ──', '── Log  runs\\m\\migration.log ──',
+    'done 4s ago · copied 10,000 · failed 0', '✖ chunk 00015  AuthorizationFailure  data/2024/big file.bin', 'WARN chunk 00014: S3 SlowDown, retrying',
+  ]) assert.ok(text.includes(part), `missing "${part}" in\n${text}`);
+  assert.match(text, /^ 1 ▶ 00013 very-small █+░+ +71% +71,012 \/ 100,000 obj +612\.00 MiB \/ 860\.00 MiB +12\.30 MiB\/s +try 1$/m);
+  assert.match(text, /^ 3 ▶ 00015 large {6}█+░+ +52% .* try 2$/m);
+  assert.match(text, /^ 4 ✔ 00012 medium {5}█{15} 100% {3}done/m);
+  assert.match(text, /^ class +size +at once +chunks +✔ done +▶ run +pending +objects +data +copied$/m);
+  assert.match(text, /^ very-small +< 1 MiB +128 +120 +40 +1 +79 +11,800,000 +3\.10 TiB +31%$/m);
+  assert.match(text, /^ very-large +≥ 100 GiB +2 +0 +0 +0 +0 +0 +0 B +—$/m, 'a class without chunks');
+  const log = lines.findIndex((l) => l.startsWith('── Log'));
+  assert.match(lines[log + 1], /^ \d\d:\d\d:\d\d {2}chunk 00041 \(small\) listed/);
+  assert.match(lines[log + 3], /WARN chunk 00014/, 'the newest line last');
+  assert.ok(!text.includes('\x1b'));
+});
+
+test('renderMigrationScreen: exactly the rows of the terminal and never wider, at any size, in any phase', () => {
+  const many = { ...SCREEN_STATE, slots: Array.from({ length: 32 }, (_, i) => SCREEN_STATE.slots[i % 4]) };
+  const long = { ...SCREEN_STATE, log: Array.from({ length: 50 }, (_, i) => ({ time: 0, level: 'ERROR', text: `line ${i} ${'x'.repeat(200)}` })) };
+  const states = [
+    SCREEN_STATE, many, long,
+    { ...SCREEN_STATE, snapshot: AGGREGATE, sizeClasses: null },
+    { ...SCREEN_STATE, phase: 'inventory', snapshot: null, inventory: { files: 12, bytes: 99 }, slots: [null, null] },
+    { ...SCREEN_STATE, phase: 'analysis', snapshot: null, slots: [] },
+    { title: 'Migrating', phase: 'inventory' },
+  ];
+  for (const [columns, rows] of [[120, 40], [80, 24], [60, 16], [59, 30], [40, 10], [200, 15], [30, 5]]) {
+    for (const state of states) {
+      for (const color of [false, true]) {
+        for (const unicode of [true, false]) {
+          const lines = renderMigrationScreen(state, { columns, rows, color, unicode });
+          assert.equal(lines.length, rows, `${columns} x ${rows}`);
+          for (const l of lines) assert.ok(visible(l).length <= columns - 1, `${columns} x ${rows}: "${visible(l)}" is too wide`);
+        }
+      }
+    }
+  }
+  const ascii = plain(renderMigrationScreen(SCREEN_STATE, { columns: 120, rows: 40, unicode: false }));
+  assert.ok(ascii.includes('> 00013') && ascii.includes('* 00012') && !/[✔✖▶█░│─⏸]/.test(ascii), ascii);
+});
+
+test('renderMigrationScreen: many workers end with "+N more running"; the log keeps 3 rows; classes on one line when rows are short', () => {
+  const slot = (i) => ({ ...SLOT, id: i + 1, sizeClass: 'very-small', percent: i, filesDone: i, filesTotal: 100, bytesDone: i, bytesTotal: 100, speed: 0 });
+  const many = { ...SCREEN_STATE, slots: Array.from({ length: 32 }, (_, i) => slot(i)) };
+  const lines = renderMigrationScreen(many, { columns: 80, rows: 24 });
+  const text = plain(lines);
+  assert.match(text, /^ \+\d+ more running$/m);
+  assert.match(text, /^ classes {3}very-small 120 \(40 ✔\) · small 50 \(2 ✔\)/m);
+  const log = lines.findIndex((l) => l.startsWith('── Log'));
+  assert.ok(lines.length - log - 1 >= 3, 'at least 3 rows of log');
+
+  // At 80 columns the slots drop their columns from the right: the bar and the percent stay.
+  assert.match(text, /^ {2}1 ▶ 00001 very-small [█░]+ +0%/m);
+  assert.ok(!text.includes('try 1'));
+
+  const uniform = plain(renderMigrationScreen({ ...SCREEN_STATE, sizeClasses: null, snapshot: AGGREGATE }, { columns: 120, rows: 40 }));
+  assert.ok(!uniform.includes('Size classes') && !uniform.includes('classes '), 'uniform chunks: no class table');
+});
+
+test('renderMigrationScreen: the inventory phase, empty slots and the small-screen fallback', () => {
+  const inventory = { ...SCREEN_STATE, phase: 'inventory', provider: 'S3 ListObjectsV2', snapshot: null, inventory: { files: 1234567, bytes: 3 * TiB }, slots: [null, null] };
+  const text = plain(renderMigrationScreen(inventory, { columns: 100, rows: 30 }));
+  assert.ok(text.includes('1,234,567 objects · 3.00 TiB so far') && text.includes('S3 ListObjectsV2 · 1,234,567 objects listed'), text);
+  assert.match(text, /^ 1 {3}waiting for the first chunk$/m);
+  assert.match(plain(renderMigrationScreen({ ...SCREEN_STATE, slots: [null] }, { columns: 100, rows: 30 })), /^ 1 {3}waiting for the listing$/m);
+  assert.match(plain(renderMigrationScreen({ ...SCREEN_STATE, snapshot: AGGREGATE, slots: [null] }, { columns: 100, rows: 30 })), /^ 1 {3}idle$/m);
+
+  // too few rows or columns: the compact lines, then the log under them
+  for (const [columns, rows] of [[120, 12], [50, 30]]) {
+    const lines = renderMigrationScreen(SCREEN_STATE, { columns, rows });
+    assert.match(lines[0], /^⠹ Migrating +2h 14m$/);
+    assert.ok(!plain(lines).includes('overall'));
+    const log = lines.findIndex((l) => l.startsWith('── Log'));
+    assert.ok(log > 0 && lines[log + 3].includes('WARN chunk 00014'), plain(lines));
+  }
+});
+
 /** A MigrationDashboard on a fake terminal, started, in the copy phase with AGGREGATE drawn. */
 async function copyingDashboard(options = {}) {
-  const term = fakeTerminal(options.columns ?? 100);
-  const dash = new MigrationDashboard({ out: term, color: false, unicode: true, tickMs: 1e6, ...options, columns: undefined });
+  const term = fakeTerminal(options.columns ?? 100, options.rows ?? 30);
+  const dash = new MigrationDashboard({ out: term, color: false, unicode: true, tickMs: 1e6, ...options, columns: undefined, rows: undefined });
   dash.start({ logFile: 'l.log' });
-  dash.copyStarted({ chunks: 2, parallel: 2 });
+  dash.copyStarted({ chunks: 2, parallel: options.parallel ?? 2, concurrency: 32 });
   dash.progress(AGGREGATE);
   await flush();
   return { term, dash };
 }
 
-test('MigrationDashboard: every update is one write that replaces the block drawn before', async () => {
+test('MigrationDashboard: start enters the alternate screen; every update is one write of the whole screen from the top left', async () => {
   const { term, dash } = await copyingDashboard();
   assert.equal(term.writes.length, 1, 'start, copyStarted and progress in one tick are one write');
   const first = unsync(term.writes[0]);
-  assert.ok(first.startsWith('\x1b[?25l'), 'cursor hidden before the first frame');
-  const height = lastHeight(first);
+  assert.ok(first.startsWith(`${ENTER}\x1b[H`), 'alternate screen and hidden cursor before the first frame');
+  assert.equal(first.split('\x1b[H').length, 2, 'one frame');
+  assert.equal(frameRows(first).length, 30, 'one row per terminal row');
+  assert.ok(first.endsWith('\x1b[K\x1b[J') && !first.endsWith('\n'), 'no newline after the last row: the screen does not scroll');
 
   dash.progress({ ...AGGREGATE, percent: 60 });
   dash.progress({ ...AGGREGATE, percent: 61 });
   await flush();
   assert.equal(term.writes.length, 2);
   const second = unsync(term.writes[1]);
-  assert.ok(second.startsWith(`\x1b[${height}A\x1b[J`), 'moves up over the previous block and erases it');
-  assert.ok(second.includes('61.0%'));
+  assert.ok(second.startsWith('\x1b[H') && second.split('\x1b[H').length === 2, 'the last frame of the tick, alone');
+  assert.ok(second.includes('61.0%') && !second.includes('60.0%'));
   dash.close();
 });
 
@@ -788,12 +884,15 @@ test('MigrationDashboard: the inventory phase lasts until the first chunk is clo
   const dash = new MigrationDashboard({ out: term, color: false, unicode: true, tickMs: 1e6 });
   dash.start({ logFile: 'l.log' });
   dash.copyStarted({ chunks: 0, parallel: 2 });
-  dash.inventoryStarted({ provider: 'S3 ListObjectsV2' });
+  dash.inventoryStarted({ provider: 'S3 ListObjectsV2', source: 's3://bkt/data' });
   dash.inventoryProgress({ files: 1000, bytes: 2048 });
   await flush();
   assert.equal(dash.phase, 'inventory');
-  dash.chunkClosed({ id: 1 });
+  assert.ok(frameRows(unsync(term.writes.at(-1))).some((r) => r.includes('waiting for the first chunk')));
+  dash.chunkClosed({ id: 1, files: 10, bytes: 2048 });
   assert.equal(dash.phase, 'copying');
+  await flush();
+  assert.ok(frameRows(unsync(term.writes.at(-1))).some((r) => r.includes('chunk 00001 listed: 10 objects, 2.00 KiB')));
   dash.close();
 
   const resumed = new MigrationDashboard({ out: fakeTerminal(), color: false, unicode: true, tickMs: 1e6 });
@@ -813,15 +912,51 @@ test('MigrationDashboard: the inventory phase lasts until the first chunk is clo
   stopAfter.close();
 });
 
-test('MigrationDashboard: message() prints above the block; failures are recorded; summary leaves the result panel and shows the cursor', async () => {
-  const { term, dash } = await copyingDashboard();
-  const height = lastHeight(unsync(term.writes.at(-1)));
+test('MigrationDashboard: slots never move; an ended chunk shows its outcome until the next chunk takes its slot', async () => {
+  let now = 0;
+  const { term, dash } = await copyingDashboard({ parallel: 3, now: () => now });
+  const ids = () => dash.migrationState().slots.map((s) => s?.id ?? null);
+  const chunk = (id) => ({ id, sizeClass: 'small', files: 100, bytes: 1000, attempts: 1, status: 'running', copied: 0, failed: 0 });
+  const [c1, c2, c3, c4] = [1, 2, 3, 4].map(chunk);
+  assert.deepEqual(ids(), [null, null, null]);
+  dash.chunkStarted(1, c1);
+  dash.chunkStarted(2, c2);
+  dash.chunkStarted(3, c3);
+  assert.deepEqual(ids(), [1, 2, 3]);
 
+  Object.assign(c2, { status: 'success', copied: 100, failed: 0, bytesCopied: 1000 });
+  now = 4000;
+  dash.chunkEnded(c2);
+  assert.deepEqual(ids(), [1, 2, 3], 'an ended chunk stays in its slot');
+  await flush();
+  let rows = frameRows(unsync(term.writes.at(-1)));
+  assert.ok(rows.some((r) => /^ 2 ✔ 00002 small █+ 100% {3}done 0s ago · copied 100 · failed 0$/.test(r)), rows.join('\n'));
+  assert.ok(rows.some((r) => r.includes('chunk 00002 (small) success')), 'the end is in the log');
+
+  dash.chunkStarted(4, c4);
+  assert.deepEqual(ids(), [1, 4, 3], 'chunk 4 takes the free slot 2; slots 1 and 3 do not move');
+  dash.chunkStarted(1, c1);
+  assert.deepEqual(ids(), [1, 4, 3], 'a chunk that starts again keeps its slot');
+
+  // the speed of a chunk is over its last seconds; its attempt is shown
+  c3.attempts = 2;
+  const running = (bytes) => ({ ...AGGREGATE, running: [{ id: 3, sizeClass: 'small', percent: bytes / 10, filesDone: 5, filesTotal: 100, bytesDone: bytes, bytesTotal: 1000 }] });
+  dash.progress(running(0));
+  now = 6000;
+  dash.progress(running(800));
+  await flush();
+  rows = frameRows(unsync(term.writes.at(-1)));
+  assert.ok(rows.some((r) => /^ 3 ▶ 00003 small +█+░+ +80% +5 \/ 100 obj +800 B \/ 1000 B +400 B\/s +try 2$/.test(r)), rows.join('\n'));
+  dash.close();
+});
+
+test('MigrationDashboard: warnings, errors and failed files go to the log panel; the log keeps the last 500 lines', async () => {
+  const { term, dash } = await copyingDashboard({ columns: 120 });
   dash.message('WARN', 'S3: slow down');
   await flush();
-  const msg = unsync(term.writes.at(-1));
-  assert.ok(msg.startsWith(`\x1b[${height}A\x1b[J`));
-  assert.ok(msg.indexOf('S3: slow down') < msg.indexOf('23.9%'), 'the message is above the dashboard');
+  const rows = frameRows(unsync(term.writes.at(-1)));
+  const log = rows.findIndex((r) => r.startsWith('── Log  l.log'));
+  assert.ok(log > 0 && rows.slice(log).some((r) => /^ \d\d:\d\d:\d\d {2}WARN S3: slow down$/.test(r)), rows.join('\n'));
 
   const before = term.writes.length;
   dash.failure(3, 'a/b.txt', 'AuthorizationFailure');
@@ -831,24 +966,49 @@ test('MigrationDashboard: message() prints above the block; failures are recorde
   assert.equal(term.writes.length, before, 'recording alone draws nothing');
   dash.progress(AGGREGATE);
   await flush();
-  const frame = unsync(term.writes.at(-1));
-  assert.ok(frame.includes('✖ AuthorizationFailure  a/b.txt   (chunk 00003)') && frame.includes('✖ unknown  d.txt'));
+  const text = frameRows(unsync(term.writes.at(-1))).join('\n');
+  assert.ok(text.includes('✖ chunk 00003  AuthorizationFailure  a/b.txt') && text.includes('✖ chunk 00004  unknown  d.txt'), text);
+  assert.ok(text.includes('errors AuthorizationFailure 2 · unknown 1'), text);
+  assert.ok(text.indexOf('S3: slow down') < text.indexOf('d.txt'), 'the newest line last');
 
+  for (let i = 0; i < 600; i++) dash.message('INFO', `line ${i}\nwith a line break`);
+  assert.equal(dash.logLines.length, 500);
+  assert.equal(dash.logLines.at(-1).text, 'line 599 with a line break');
+  dash.close();
+});
+
+test('MigrationDashboard: summary leaves the full screen and prints the result panel; close() alone also leaves it', async () => {
+  const { term, dash } = await copyingDashboard();
+  dash.failure(3, 'a/b.txt', 'AuthorizationFailure');
+  dash.failure(3, 'c.txt', 'AuthorizationFailure');
+  dash.failure(4, 'd.txt');
   dash.summary(MIG_RESULT);
   await flush();
   const end = unsync(term.writes.at(-1));
-  assert.ok(end.includes('Migration completed with failed files'));
-  assert.ok(end.includes('errors       AuthorizationFailure (2) · unknown (1)'));
-  assert.ok(end.endsWith('\x1b[?25h'), 'the cursor is shown again');
+  assert.ok(end.startsWith(LEAVE), 'the normal screen and the cursor come back first');
+  assert.ok(end.includes('Migration completed with failed files') && end.includes('errors       AuthorizationFailure (2) · unknown (1)'), end);
+  assert.ok(!end.includes('\x1b[H'), 'the panel is printed, not drawn at the top');
   const count = term.writes.length;
   dash.close();
   dash.summary(MIG_RESULT);
+  dash.progress(AGGREGATE);
   await flush();
   assert.equal(term.writes.length, count, 'nothing more is drawn after the end');
+  dash.message('WARN', 'after the end');
+  await flush();
+  assert.equal(unsync(term.writes.at(-1)), 'after the end\n', 'a message after the end is printed as it is');
+
+  const other = await copyingDashboard();
+  other.dash.close();
+  await flush();
+  assert.ok(unsync(other.term.writes.at(-1)).includes(LEAVE), 'close() without a summary leaves the full screen');
+  other.dash.close();
+  await flush();
+  assert.equal(other.term.writes.filter((w) => w.includes(LEAVE)).length, 1, 'only once');
 });
 
-test('MigrationDashboard: the timer animates the clock, resize redraws, and close() clears both', async () => {
-  const term = fakeTerminal(100);
+test('MigrationDashboard: the timer animates the clock, resize clears and redraws, and close() clears both', async () => {
+  const term = fakeTerminal(100, 30);
   let now = 0;
   const dash = new MigrationDashboard({ out: term, color: false, unicode: true, tickMs: 5, now: () => now });
   dash.start({ logFile: 'l.log' });
@@ -862,22 +1022,25 @@ test('MigrationDashboard: the timer animates the clock, resize redraws, and clos
 
   assert.equal(term.listeners.resize.length, 1);
   term.columns = 50;
+  term.rows = 12;
+  const before = term.writes.length;
   term.listeners.resize[0]();
   await flush();
-  const narrow = unsync(term.writes.at(-1));
-  assert.ok(!narrow.includes('elapsed'), 'redrawn with the narrow layout');
-  assert.match(narrow, /^\x1b\[\d+A\x1b\[J/);
+  const small = unsync(term.writes.slice(before).find((w) => w.includes('\x1b[2J')) ?? '');
+  assert.ok(small.startsWith('\x1b[2J\x1b[H'), 'the screen is cleared before the frame at the new size');
+  assert.equal(frameRows(small).length, 12);
+  assert.ok(!small.includes('overall'), 'the compact lines on a small screen');
 
   dash.close();
   assert.equal(term.listeners.resize.length, 0, 'resize listener removed');
   await flush();
   const count = term.writes.length;
-  assert.ok(term.writes.at(-1).includes('\x1b[?25h'), 'the cursor is shown');
+  assert.ok(term.writes.at(-1).includes(LEAVE), 'the normal screen and the cursor are back');
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(term.writes.length, count, 'the timer stopped');
 });
 
-test('MigrationDashboard: a whole migrate run with the SDK fakes is drawn in place, copies while listing, and ends with the result panel; nothing leaks', async () => {
+test('MigrationDashboard: a whole migrate run with the SDK fakes on the full screen, copies while listing, and ends with the result panel; nothing leaks', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'azc-ui-mig-e2e-'));
   const objects = Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`data/f${i + 1}.bin`, { size: 10 }]));
   const s3 = fakeS3(objects, { pageSize: 2 });
@@ -890,8 +1053,7 @@ test('MigrationDashboard: a whole migrate run with the SDK fakes is drawn in pla
     await new Promise((resolve) => setTimeout(resolve, 60));
   };
   await withEnv({ AWS_ACCESS_KEY_ID: KEY, AWS_SECRET_ACCESS_KEY: SECRET }, async () => {
-    const term = fakeTerminal(100);
-    term.rows = 40;
+    const term = fakeTerminal(100, 40);
     const view = new MigrationDashboard({ out: term, color: true, unicode: true, tickMs: 5 });
     const code = await realMigration.migrateCommand({
       outputDir: dir, targetSasUrl: SAS, sourceBucket: 'bkt', sourcePrefix: 'data', sourceRegion: 'ap-southeast-2', s3, container, yes: true,
@@ -900,12 +1062,16 @@ test('MigrationDashboard: a whole migrate run with the SDK fakes is drawn in pla
     await flush();
     assert.equal(code, 0);
     assert.equal(container.blobs.size, 6);
-    const screen = visible(term.writes.join('').replaceAll('\x1b[?2026h', '').replaceAll('\x1b[?2026l', ''));
-    assert.ok(screen.includes('Inventory (S3 ListObjectsV2)'), 'the inventory phase was drawn');
-    assert.ok(screen.includes('objects listed'), 'the copy was drawn while the listing ran');
-    assert.ok(screen.includes('Migration completed') && screen.includes('chunks 3/3 copied'), 'the result panel');
+    const all = term.writes.join('').replaceAll('\x1b[?2026h', '').replaceAll('\x1b[?2026l', '');
+    const screen = visible(all);
+    assert.ok(all.startsWith(ENTER), 'the alternate screen first');
+    assert.ok(screen.includes('S3 ListObjectsV2 · '), 'the inventory phase was drawn');
+    assert.ok(screen.includes('objects listed ·'), 'the copy was drawn while the listing ran');
+    assert.ok(screen.includes('── Chunks being copied (2 workers)') && screen.includes('chunk 00001 started') && screen.includes('chunk 00001 success'), 'the slots and the log');
+    const end = all.slice(all.lastIndexOf(LEAVE));
+    assert.ok(visible(end).includes('Migration completed') && visible(end).includes('chunks 3/3 copied'), 'the result panel on the normal screen');
+    assert.ok(!end.includes('\x1b[H') && end.split(LEAVE).length === 2, 'nothing drawn on the full screen after the result panel');
     assert.ok(!screen.includes('Migration summary') && !screen.includes('Migration: '), 'no plain output with a view');
-    assert.ok(term.writes.join('').replaceAll('\x1b[?2026l', '').trimEnd().endsWith('\x1b[?25h'), 'cursor shown at the end');
     for (const secret of SECRET_TEXTS) assert.ok(!term.writes.join('').includes(secret), `${secret} on screen`);
     assert.equal(term.listeners.resize?.length ?? 0, 0, 'resize listener removed');
   });

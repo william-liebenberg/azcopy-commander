@@ -5,16 +5,18 @@ import { colorEnabled, createStyle, fit, symbolsFor, unicodeSupported, visible }
 
 /*
  * What the live dashboards of the wizard share, in the style of its @clack/prompts: the layout widths, the bars and
- * the `Dashboard` base class that draws a block of lines in place (see migration-dashboard.js).
+ * the `Dashboard` base class that draws a block of lines in place, or a whole screen on the alternate screen buffer
+ * (see migration-dashboard.js and migration-screen.js).
  *
- * Layouts: wide (>= 60 columns, sparkline from 80), narrow (36-59), very narrow (< 36: one line).
- * Every line is cut to the terminal width, so a line never wraps and the cursor arithmetic stays exact.
+ * Layouts: full screen from 60 columns and 16 rows (sparkline from 80 columns), compact lines (36+ columns) and one
+ * line (< 36 columns) below. Every line is cut to the terminal width, so a line never wraps and the cursor
+ * arithmetic stays exact.
  */
 
 export const WIDE_MIN = 60;
 export const SPARK_MIN = 80;
 export const NARROW_MIN = 36;
-export const MAX_PANEL = 76;
+export const SCREEN_MIN_ROWS = 16;
 export const HISTORY = 8;
 export const SHOWN_FAILURES = 3;
 export const KEPT_OUTPUT = 50;
@@ -77,21 +79,30 @@ export function scanningBar(width, frame, st, sym) {
 
 const HIDE_CURSOR = '\x1b[?25l';
 const SHOW_CURSOR = '\x1b[?25h';
+const ENTER_SCREEN = '\x1b[?1049h';
+const LEAVE_SCREEN = '\x1b[?1049l';
+const CLEAR_SCREEN = '\x1b[2J';
 
 /**
  * The base of a live view: redraws in place on a short timer (spinner, clock) and when told to, prints warnings above
- * the block. A subclass implements `draw(before)` (with `paint`) and its own view methods. Every redraw is one
- * write, through `coalescedOutput`.
+ * the block. A subclass implements `draw(before)` (with `paint`, or `paintScreen` in full-screen mode) and its own
+ * view methods. Every redraw is one write, through `coalescedOutput`.
+ *
+ * Full-screen mode (`fullScreen`): `start` switches to the alternate screen buffer and hides the cursor, each frame
+ * is drawn from the top left, a resize clears the screen first, and `leaveScreen` (also called by `close` and on
+ * process exit) brings the normal screen and the cursor back.
  *
  *   out       the terminal stream (default process.stdout)
  *   title     the header line, e.g. "Copying"
  *   route     [from, to]: shown after the title as "from -> to"
  *   columns   fixed terminal width (default: the stream's, tracked on resize)
+ *   rows      fixed terminal height (default: the stream's)
+ *   fullScreen   draw on the alternate screen (see above)
  *   color, unicode   override NO_COLOR / FORCE_COLOR / terminal detection
  *   env, now, tickMs   test hooks
  */
 export class Dashboard {
-  constructor({ out = process.stdout, title = 'Migrating', route, columns, rows, color, unicode, env = process.env, now = Date.now, tickMs = TICK_MS } = {}) {
+  constructor({ out = process.stdout, title = 'Migrating', route, columns, rows, fullScreen = false, color, unicode, env = process.env, now = Date.now, tickMs = TICK_MS } = {}) {
     this.raw = out;
     this.out = coalescedOutput(out);
     this.fixedColumns = columns;
@@ -101,6 +112,7 @@ export class Dashboard {
     this.title = route ? `${title}  ${route[0]} ${symbolsFor(this.unicode).arrow} ${route[1]}` : title;
     this.now = now;
     this.tickMs = tickMs;
+    this.fullScreen = fullScreen;
 
     this.snapshot = null;
     this.speeds = [];
@@ -114,8 +126,16 @@ export class Dashboard {
     this.cursorHidden = false;
     this.active = false; // between start() and finish() / close()
     this.timer = null;
-    this.onResize = () => this.draw();
-    this.onExit = () => this.raw.write(SHOW_CURSOR); // synchronous: the coalesced write would never run
+    this.screenOn = false; // full screen: between start() and leaveScreen()
+    this.screenEntered = false; // the switch to the alternate screen was written
+    this.screenPrefix = ''; // control sequences written before the next frame
+    this.screenLines = null; // the frame to write at the end of this tick
+    this.onResize = () => {
+      if (this.screenOn) this.screenPrefix += CLEAR_SCREEN;
+      this.draw();
+    };
+    // Synchronous: the coalesced write would never run.
+    this.onExit = () => this.raw.write(this.screenEntered ? `${LEAVE_SCREEN}${SHOW_CURSOR}` : SHOW_CURSOR);
   }
 
   get columns() {
@@ -145,6 +165,39 @@ export class Dashboard {
     this.lineWidths = keep ? [] : lines.map((l) => visible(l).length);
   }
 
+  /**
+   * Full screen: draws `lines` (one per row) from the top left, each followed by an erase to the end of the row, and
+   * erases what is below. The frames of one tick are one write, of the last frame.
+   */
+  paintScreen(lines) {
+    if (!this.screenOn) return;
+    const queued = this.screenLines !== null;
+    this.screenLines = lines;
+    if (queued) return;
+    queueMicrotask(() => {
+      const frame = this.screenLines;
+      this.screenLines = null;
+      if (!this.screenOn || !frame) return;
+      const prefix = this.screenPrefix;
+      this.screenPrefix = '';
+      this.screenEntered = true;
+      this.out.write(`${prefix}\x1b[H${frame.join('\x1b[K\r\n')}\x1b[K\x1b[J`);
+    });
+  }
+
+  /** Full screen: back to the normal screen with the cursor shown; `after` is written there. Safe to call more than once. */
+  leaveScreen(after = '') {
+    if (!this.screenOn) {
+      if (after) this.out.write(after);
+      return;
+    }
+    this.screenOn = false;
+    this.screenLines = null;
+    this.out.write(`${this.screenEntered ? LEAVE_SCREEN : ''}${SHOW_CURSOR}${after}`);
+    this.screenEntered = false;
+    this.cursorHidden = false;
+  }
+
   /** Draws the block again; `before` is text printed above it. Implemented by the subclass. */
   draw() {}
 
@@ -154,6 +207,11 @@ export class Dashboard {
     this.logFile = logFile;
     this.startedAt = this.now();
     this.active = true;
+    if (this.fullScreen) {
+      this.screenOn = true;
+      this.screenPrefix = `${ENTER_SCREEN}${HIDE_CURSOR}`; // written with the first frame
+      this.cursorHidden = true;
+    }
     this.timer = setInterval(() => {
       this.frame++;
       this.draw();
@@ -195,12 +253,13 @@ export class Dashboard {
     if (line) this.output = [...this.output, { level, text: line }].slice(-KEPT_OUTPUT);
   }
 
-  /** Releases the timer, the listeners and the cursor. Safe to call more than once. */
+  /** Releases the timer, the listeners, the full screen and the cursor. Safe to call more than once. */
   close() {
     if (this.active) {
       this.stop();
-      this.out.write(SHOW_CURSOR); // the dashboard stays as it was last drawn
+      if (!this.screenOn) this.out.write(SHOW_CURSOR); // in place, the dashboard stays as it was last drawn
     }
+    this.leaveScreen();
     this.cursorHidden = false;
   }
 

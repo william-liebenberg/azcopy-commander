@@ -1,25 +1,25 @@
 import { formatBytes, formatCount } from '../format.js';
-import { migrationTitle } from '../migration-view.js';
+import { chunkEndLine, chunkingLines, chunkLabel, copyStartedLines, migrationTitle } from '../migration-view.js';
 import { chunkId } from '../chunks.js';
-import { createStyle, symbolsFor } from './style.js';
-import {
-  clamp, compactDuration, compose, Dashboard, duration, HISTORY, MAX_PANEL, NARROW_MIN, progressBar, rate, scanningBar, SHOWN_FAILURES,
-  SPARK_MIN, sparkline, WIDE_MIN,
-} from './dashboard.js';
+import { createStyle, symbolsFor, visible } from './style.js';
+import { clamp, compactDuration, compose, Dashboard, duration, HISTORY, NARROW_MIN, progressBar, rate, scanningBar } from './dashboard.js';
+import { renderMigrationScreen } from './migration-screen.js';
 
 /*
  * The live dashboard of `migrate` in the wizard.
  *
- *   renderMigrationDashboard(state, { columns, rows, color, unicode })   pure: the lines for one frame
- *   MigrationDashboard                                                   a migration view (see ../migration-view.js)
+ *   renderMigrationDashboard(state, { columns, color, unicode })   pure: the compact lines of one frame, or the result panel
+ *   renderMigrationScreen (migration-screen.js)                     pure: the lines of the full screen
+ *   MigrationDashboard                                              a migration view (see ../migration-view.js)
  *
  * Phases: the inventory (animated bar and a running count) until the first chunk is closed, then the copy, with
- * a "listing" line while the listing still runs (overall bar with ETA, one cell per running chunk, counters, the latest failures) and the result panel.
- * Layouts (see dashboard.js): wide (>= 60 columns), narrow (36-59), very narrow (< 36: one line).
+ * a "listing" line while the listing still runs, and at the end the result panel, printed on the normal screen.
+ * The compact lines (36+ columns, one line below) are what the full screen shows when the terminal is too small for it.
  */
 
-const RUNNING_ROWS = 4; // rows of running chunks at most (more are summarised)
-const CELL = 24; // width of one running chunk: "▶ 00013 ██████░░░░  71%" and a gap
+const LOG_LINES = 500; // the lines of the log panel kept
+const SPEED_WINDOW_MS = 10_000; // the speed of a chunk is over its last 10 seconds
+const num = (v) => Number(v) || 0;
 
 const TONES = { success: 'green', partial: 'yellow', interrupted: 'yellow', stopped: 'yellow', failed: 'red' };
 
@@ -62,36 +62,15 @@ function renderResult(state, { columns, st, sym }) {
   return lines;
 }
 
-/** The room the size class names of the running chunks take in a cell ("00013 small ..."), 0 without classes. */
-const classWidth = (running) => Math.max(0, ...running.map((c) => (c.sizeClass ? c.sizeClass.length + 1 : 0)));
-
-/** The cells of the running chunks, `perRow` to a line; `nameWidth` (see classWidth) holds the size class. */
-function runningRows(running, { perRow, st, sym, barWidth, nameWidth = 0 }) {
-  const shown = running.slice(0, perRow * RUNNING_ROWS);
-  const rows = [];
-  for (let i = 0; i < shown.length; i += perRow) {
-    const parts = [];
-    for (const c of shown.slice(i, i + perRow)) {
-      const percent = `${Math.round(c.percent)}%`.padStart(4);
-      const name = nameWidth > 0 ? [[` ${(c.sizeClass ?? '').padEnd(nameWidth - 1)}`, st.dim]] : [];
-      parts.push([`${sym.run} `, st.cyan], [chunkId(c.id)], ...name, [' '], ...progressBar(barWidth, c.percent / 100, st, sym), [` ${percent}`, st.bold], [' '.repeat(CELL - (2 + 5 + 1 + barWidth + 5))]);
-    }
-    rows.push(parts);
-  }
-  if (running.length > shown.length) rows.push([[`+${running.length - shown.length} more running`, st.dim]]);
-  return rows;
-}
-
 /**
- * The lines of one frame.
+ * The compact lines of one frame (or the result panel).
  *
  *   state    { title, phase, frame, elapsedSeconds, provider, inventory: { files, bytes }, analysis: [lines],
- *              chunkCount, parallel, snapshot (aggregate, see MigrationProgress), speeds, failures: [{ id, path, code }],
- *              output, errorCodes, logFile, result }
+ *              chunkCount, parallel, snapshot (aggregate, see MigrationProgress), speeds, errorCodes, logFile, result }
  *            `result` (see migrateCommand) switches to the result panel.
- *   options  { columns, rows, color, unicode }
+ *   options  { columns, color, unicode }
  */
-export function renderMigrationDashboard(state, { columns = 80, rows, color = false, unicode = true } = {}) {
+export function renderMigrationDashboard(state, { columns = 80, color = false, unicode = true } = {}) {
   const st = createStyle(color);
   const sym = symbolsFor(unicode);
   if (state.result) return renderResult(state, { columns, st, sym });
@@ -114,90 +93,41 @@ export function renderMigrationDashboard(state, { columns = 80, rows, color = fa
     return [compose([[`${listing ? `+${formatCount(snap.listed)}` : percent} ${rate(snap.throughput).replace(' ', '')} ${listing ? '' : compactDuration(snap.etaSeconds)}`.trimEnd()]], limit)];
   }
 
-  if (columns < WIDE_MIN) {
-    const gap = Math.max(1, limit - 2 - phaseName.length - elapsed.length - 1);
-    const barWidth = clamp(limit - 8, 8, 30);
-    const lines = [compose([[spin, st.cyan], [` ${phaseName}`, st.bold], [' '.repeat(gap)], [elapsed, st.dim]], limit)];
-    if (!copying) {
-      lines.push(compose([...scanningBar(barWidth, state.frame ?? 0, st, sym)], limit), compose([[`${formatCount(inv.files)} objects · ${formatBytes(inv.bytes)}`]], limit));
-      return lines;
-    }
-    if (listing) lines.push(compose([[`listing ${formatCount(snap.listed)} · ${formatCount(snap.chunksTotal)} chunks`, st.yellow]], limit));
-    lines.push(
-      compose([...progressBar(barWidth, ratio, st, sym), [` ${percent || total}`, st.bold]], limit),
-      compose([[rate(snap.throughput), st.bold], [' · ', st.dim], [`ETA ${eta}`]], limit),
-      compose([
-        [`${sym.ok} ${formatCount(snap.chunksDone)}/${formatCount(snap.chunksTotal)}`, st.green], [' '],
-        [`${sym.run} ${formatCount(snap.chunksRunning)}`, st.cyan], [' '],
-        [`${sym.fail} ${formatCount(snap.failed)}`, snap.failed > 0 ? st.red : st.dim],
-      ], limit),
-    );
+  const gap = Math.max(1, limit - 2 - phaseName.length - elapsed.length - 1);
+  const barWidth = clamp(limit - 13, 8, 30); // and " 184.20 TiB+"
+  const lines = [compose([[spin, st.cyan], [` ${phaseName}`, st.bold], [' '.repeat(gap)], [elapsed, st.dim]], limit)];
+  if (!copying) {
+    lines.push(compose([...scanningBar(barWidth, state.frame ?? 0, st, sym)], limit), compose([[`${formatCount(inv.files)} objects · ${formatBytes(inv.bytes)}`]], limit));
     return lines;
   }
-
-  // wide
-  const content = limit - 3;
-  const panel = Math.min(content, MAX_PANEL);
-  const bar = st.dim(sym.bar);
-  const row = (parts) => `${bar}  ${compose(parts, content)}`;
-  const heading = state.phase === 'inventory' ? `Inventory (${state.provider ?? 'S3 ListObjectsV2'})` : phaseName;
-  const gap = Math.max(1, panel - 2 - heading.length - 'elapsed '.length - elapsed.length);
-  const lines = [
-    bar,
-    `${st.cyan(sym.step)}  ${compose([[state.title ?? 'Migrating', st.bold]], content)}`,
-    bar,
-    row([[spin, st.cyan], [` ${heading}`, st.bold], [' '.repeat(gap)], ['elapsed ', st.dim], [elapsed]]),
-  ];
-
-  if (state.phase === 'inventory') {
-    const text = `  ${formatCount(inv.files)} objects · ${formatBytes(inv.bytes)} so far`;
-    lines.push(row([...scanningBar(clamp(panel - text.length, 10, 40), state.frame ?? 0, st, sym), [text, st.yellow]]));
-  } else if (!copying) {
-    for (const l of state.analysis ?? []) lines.push(row([[l, /^WARNING/.test(l) ? st.yellow : st.dim]]));
-    lines.push(row([[state.chunkCount === undefined ? 'analysing the listing ...' : `${formatCount(state.chunkCount)} chunk(s) listed`, st.cyan]]));
-  } else {
-    if (listing) {
-      const text = `  ${formatCount(snap.listed)} objects listed · ${formatCount(snap.chunksTotal)} chunk(s) so far`;
-      lines.push(row([['listing ', st.dim], ...scanningBar(clamp(panel - 8 - text.length, 10, 30), state.frame ?? 0, st, sym), [text, st.yellow]]));
-    }
-    const statsText = `  ${percent.padStart(5)}   ${formatBytes(snap.bytesDone)} / ${total}`;
-    const barWidth = clamp(panel - statsText.length, 10, 40);
-    const speeds = state.speeds ?? [];
-    lines.push(
-      row([...progressBar(barWidth, ratio, st, sym), [statsText.slice(0, 7), st.bold], [statsText.slice(7)]]),
-      row([['speed ', st.dim], [rate(snap.throughput), st.bold],
-        ...(columns >= SPARK_MIN && speeds.length > 1 ? [['  '], [sparkline(speeds, sym), st.cyan]] : []),
-        ['   ETA ', st.dim], [eta]]),
-      row([
-        ['chunks ', st.dim], [`${sym.ok} ${formatCount(snap.chunksDone)}`, st.green], ['  '],
-        [`${sym.run} ${formatCount(snap.chunksRunning)}`, st.cyan], ['  '],
-        [`${formatCount(snap.chunksPending)} pending`, st.dim], ['  '],
-        [`${sym.fail} ${formatCount(snap.chunksExhausted)}`, snap.chunksExhausted > 0 ? st.red : st.dim],
-        ['      '], [`copied ${formatCount(snap.copied)}`, st.green], ['   '], [`ignored ${formatCount(snap.ignored ?? 0)}`, st.dim], ['   '],
-        [`${sym.fail} failed ${formatCount(snap.failed)}`, snap.failed > 0 ? st.red : st.dim],
-      ]),
-    );
-    const nameWidth = classWidth(snap.running ?? []);
-    const perRow = clamp(Math.floor(content / (CELL + nameWidth)), 1, 4);
-    const room = rows ? Math.max(1, rows - 1 - lines.length - SHOWN_FAILURES - 2) : RUNNING_ROWS + 1;
-    for (const parts of runningRows(snap.running ?? [], { perRow, st, sym, barWidth: 10, nameWidth }).slice(0, Math.min(RUNNING_ROWS + 1, room))) lines.push(row(parts));
-    // The error code comes first: it is the part that must survive when a long path is shortened.
-    for (const { id, path, code } of (state.failures ?? []).slice(-SHOWN_FAILURES)) {
-      lines.push(row([[`${sym.fail} `, st.red], [`${code ?? '?'}  `, st.red], [path, st.yellow], [`   (chunk ${chunkId(id)})`, st.dim]]));
-    }
-  }
-  if (state.logFile) lines.push(row([['log  ', st.dim], [state.logFile, st.dim]]));
+  if (listing) lines.push(compose([[`listing ${formatCount(snap.listed)} · ${formatCount(snap.chunksTotal)} chunks`, st.yellow]], limit));
+  lines.push(
+    compose([...progressBar(barWidth, ratio, st, sym), [` ${percent || total}`, st.bold]], limit),
+    compose([[rate(snap.throughput), st.bold], [' · ', st.dim], [`ETA ${eta}`]], limit),
+    compose([
+      [`${sym.ok} ${formatCount(snap.chunksDone)}/${formatCount(snap.chunksTotal)}`, st.green], [' '],
+      [`${sym.run} ${formatCount(snap.chunksRunning)}`, st.cyan], [' '],
+      [`${sym.fail} ${formatCount(snap.failed)}`, snap.failed > 0 ? st.red : st.dim],
+    ], limit),
+  );
   return lines;
 }
 
 /**
- * A migration view (see ../migration-view.js) that draws the dashboard in place, with the timer, resize handling,
- * coalesced writes and cursor handling of `Dashboard`. It shows the inventory phase until the first chunk is closed
- * (or is ready when a migration is continued), then the copy.
+ * A migration view (see ../migration-view.js) that draws the full-screen dashboard on the alternate screen, with the
+ * timer, resize handling, coalesced writes and cursor handling of `Dashboard`. It shows the inventory phase until the
+ * first chunk is closed (or is ready when a migration is continued), then the copy. It keeps:
+ *
+ *   slots        one per worker: a chunk that starts takes the first free one (or the one it holds) and keeps it;
+ *                a chunk that ends stays there, with its outcome, until the next chunk takes the slot
+ *   logLines     the last 500 lines of the log panel: chunks listed, started and ended, failed files, warnings
+ *   sizeClasses  the size classes of the migration, for the class table
+ *
+ * At the end, the normal screen comes back with the result panel.
  */
 export class MigrationDashboard extends Dashboard {
   constructor({ delta = false, round, ...options } = {}) {
-    super({ title: delta ? 'Delta migration' : 'Migrating', ...options });
+    super({ title: delta ? 'Delta migration' : 'Migrating', fullScreen: true, ...options });
     if (round > 0) this.title += ` · round ${round}`; // with --repeat
     this.phase = 'inventory';
     this.provider = null;
@@ -206,14 +136,51 @@ export class MigrationDashboard extends Dashboard {
     this.chunkCount = undefined;
     this.parallel = 0;
     this.copying = false; // copyStarted was called: the copy phase starts with the first chunk
+    this.slots = []; // null or { chunk, samples: [[time, bytesDone]], percent, endedAt?, outcome? }
+    this.logLines = []; // [{ time, level, text }]
+    this.sizeClasses = null;
+  }
+
+  /** Adds a line to the log panel (drawn by the caller or the timer). */
+  addLog(level, text) {
+    // eslint-disable-next-line no-control-regex
+    const line = visible(text).replace(/[\x00-\x1f\x7f]+/g, ' ').trim();
+    if (!line) return;
+    this.logLines.push({ time: this.now(), level, text: line });
+    if (this.logLines.length > LOG_LINES) this.logLines.splice(0, this.logLines.length - LOG_LINES);
+  }
+
+  /** What the renderer shows of a slot. */
+  slotState(slot, live, now) {
+    const { chunk } = slot;
+    const base = { id: chunk.id, sizeClass: chunk.sizeClass, attempt: Math.max(1, num(chunk.attempts)) };
+    if (slot.endedAt !== undefined) {
+      return {
+        ...base, state: 'ended', outcome: slot.outcome, percent: slot.outcome === 'success' ? 100 : slot.percent,
+        agoSeconds: Math.max(0, (now - slot.endedAt) / 1000), copied: num(chunk.copied), failed: num(chunk.failed),
+      };
+    }
+    const [first, last] = [slot.samples[0], slot.samples.at(-1)];
+    return {
+      ...base,
+      state: 'running',
+      percent: num(live?.percent),
+      filesDone: num(live?.filesDone),
+      filesTotal: live ? num(live.filesTotal) : num(chunk.files),
+      bytesDone: num(live?.bytesDone),
+      bytesTotal: live ? num(live.bytesTotal) : num(chunk.bytes),
+      speed: first && last[0] > first[0] ? ((last[1] - first[1]) / (last[0] - first[0])) * 1000 : 0,
+    };
   }
 
   migrationState(extra = {}) {
+    const now = this.now();
+    const live = new Map((this.snapshot?.running ?? []).map((r) => [r.id, r]));
     return {
       title: this.title,
       phase: this.phase,
       frame: this.frame,
-      elapsedSeconds: (this.now() - this.startedAt) / 1000,
+      elapsedSeconds: (now - this.startedAt) / 1000,
       provider: this.provider,
       inventory: this.inventory,
       analysis: this.analysisLines,
@@ -221,22 +188,35 @@ export class MigrationDashboard extends Dashboard {
       parallel: this.parallel,
       snapshot: this.snapshot,
       speeds: this.speeds,
-      failures: this.failures,
       errorCodes: [...this.errorCounts].sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]))),
       logFile: this.logFile,
+      slots: this.slots.map((slot) => (slot ? this.slotState(slot, live.get(slot.chunk.id), now) : null)),
+      sizeClasses: this.sizeClasses,
+      log: this.logLines,
       ...extra,
     };
   }
 
-  draw(before = '') {
+  draw() {
     if (!this.active) return;
-    this.paint(renderMigrationDashboard(this.migrationState(), this.options()), { before });
+    this.paintScreen(renderMigrationScreen(this.migrationState(), this.options()));
   }
 
-  // ---- the migration view interface (message(), log(), close() are the ones of Dashboard)
+  // ---- the migration view interface (log() and close() are the ones of Dashboard)
 
-  inventoryStarted({ provider }) {
+  /** A warning or error: a line of the log panel (printed as it is once the dashboard has ended). */
+  message(level, text) {
+    if (!this.active) {
+      this.out.write(`${text}\n`);
+      return;
+    }
+    this.addLog(level, text);
+    this.draw();
+  }
+
+  inventoryStarted({ provider, source, includeAfter, resumeAfter }) {
     this.provider = provider;
+    this.addLog('INFO', `Inventory (${provider}) of ${source ?? 'the source'}${includeAfter ? `, modified on/after ${includeAfter}` : ''}${resumeAfter ? ', continued after the last closed chunk' : ''}`);
     this.draw();
   }
 
@@ -247,49 +227,80 @@ export class MigrationDashboard extends Dashboard {
   analysis(summary, lines) {
     if (this.phase !== 'copying') this.phase = 'analysis';
     this.analysisLines = lines;
+    for (const l of lines) this.addLog(/^WARNING/.test(l) ? 'WARN' : 'INFO', `analysis: ${l}`);
     this.draw();
   }
 
-  chunking({ chunks }) {
-    this.chunkCount = chunks.length;
+  chunking(info) {
+    this.chunkCount = info.chunks.length;
+    this.sizeClasses ??= info.sizeClasses ?? null;
+    chunkingLines(info).forEach((l) => this.addLog('INFO', l));
     this.draw();
   }
 
-  copyStarted({ chunks, parallel }) {
+  copyStarted(info) {
+    const { chunks, parallel } = info;
     this.copying = true;
     if (chunks > 0) this.phase = 'copying';
     this.parallel = parallel;
+    this.sizeClasses = info.sizeClasses ?? null;
+    while (this.slots.length < parallel) this.slots.push(null);
+    copyStartedLines(info).forEach((l) => this.addLog('INFO', l));
     this.draw();
   }
 
-  chunkClosed() {
+  chunkClosed(chunk) {
     if (this.copying) this.phase = 'copying';
+    this.addLog('INFO', `${chunkLabel(chunk)} listed: ${formatCount(chunk.files)} objects, ${formatBytes(chunk.bytes)}`);
     this.draw();
   }
 
-  chunkStarted() {}
+  chunkStarted(id, chunk) {
+    const entry = chunk ?? { id };
+    this.addLog('INFO', `${chunkLabel(entry)} started`);
+    let at = this.slots.findIndex((s) => s?.chunk.id === id);
+    if (at < 0) at = this.slots.findIndex((s) => !s || s.endedAt !== undefined);
+    const slot = { chunk: entry, samples: [], percent: 0 };
+    if (at < 0) this.slots.push(slot);
+    else this.slots[at] = slot;
+    this.draw();
+  }
 
-  chunkEnded() {}
+  chunkEnded(chunk) {
+    const slot = this.slots.find((s) => s?.chunk.id === chunk.id && s.endedAt === undefined);
+    if (slot) Object.assign(slot, { chunk, endedAt: this.now(), outcome: chunk.status });
+    this.addLog(chunk.status === 'success' ? 'INFO' : chunk.status === 'interrupted' ? 'WARN' : 'ERROR', chunkEndLine(chunk));
+    this.draw();
+  }
 
   progress(snapshot) {
     this.snapshot = snapshot;
     this.speeds = [...this.speeds, snapshot.throughput].slice(-HISTORY);
+    const now = this.now();
+    for (const r of snapshot.running ?? []) {
+      const slot = this.slots.find((s) => s?.chunk.id === r.id && s.endedAt === undefined);
+      if (!slot) continue;
+      const bytes = num(r.bytesDone);
+      if (bytes < (slot.samples.at(-1)?.[1] ?? 0)) slot.samples = []; // a new attempt
+      slot.samples.push([now, bytes]);
+      while (slot.samples.length > 2 && now - slot.samples[0][0] > SPEED_WINDOW_MS) slot.samples.shift();
+      slot.percent = num(r.percent);
+    }
     this.draw();
   }
 
   failure(id, relativePath, errorCode) {
     const code = errorCode ? String(errorCode) : 'unknown';
     this.errorCounts.set(code, (this.errorCounts.get(code) ?? 0) + 1);
-    this.failures = [...this.failures, { id, path: relativePath, code }].slice(-SHOWN_FAILURES);
-  }
+    // The error code comes before the path: it is the part that must survive when a long path is shortened.
+    this.addLog('FAIL', `chunk ${chunkId(id)}  ${code}  ${relativePath}`);
+  } // drawn by the timer: a burst of failures is one redraw
 
-  /** Replaces the dashboard with the result panel. */
+  /** Leaves the full screen and prints the result panel on the normal screen. */
   summary(result) {
-    if (this.active) {
-      this.stop();
-      this.paint(renderMigrationDashboard(this.migrationState({ result }), this.options()), { keep: true });
-      this.out.write('\x1b[?25h');
-      this.cursorHidden = false;
-    }
+    if (!this.active) return;
+    this.stop();
+    const lines = renderMigrationDashboard(this.migrationState({ result }), this.options());
+    this.leaveScreen(lines.map((l) => `${l}\n`).join(''));
   }
 }

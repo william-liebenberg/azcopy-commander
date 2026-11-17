@@ -229,22 +229,44 @@ A *delta migration* first asks for the baseline: a migration that ended `success
 
 **Options given on the command line** are picked up by the wizard (`azcopy-commander --source-bucket my-bucket --source-region ap-southeast-2 --parallel 4 --chunk-files 500000`, with or without `ui`). Right after you choose the action it lists the ones that apply and asks, as it does for secrets found in the environment, whether to *Use them* (the questions they answer are skipped) or to *Go through the questions with them filled in*. Details: `--source-bucket` makes the source complete, so an absent `--source-prefix` / `--source-region` means the whole bucket / the region asked from S3 (shown in the list; choose the second option to change them); `--last-copy-date` answers the delta migration's baseline question (including `auto`) and is applied to *List*; `--repeat`, `--repeat-until` and `--repeat-max` answer the *When it ends?* question; `--chunk-minutes`, `--block-size`, `--max-attempts` and `--stop-after` have no question and always apply to a migration; `--parallel`, `--concurrency` and `--max-attempts` apply when continuing one; `--target-sas-url` is used as is (it is visible in the process list of the machine, so the environment variable is the safer way). An option that cannot be used is reported and asked for as usual.
 
-A migration started from the wizard on a terminal shows a live dashboard instead of the plain output: the listing with a running count until the first chunk is closed, then an overall bar with speed and ETA, a "listing" line while the listing still runs (the total so far has a `+`, and there is no ETA until it ends), chunks done / running / pending / out of attempts, one cell per running chunk, the latest failures (with their error code and chunk) and finally a result panel (green for success, yellow for failed files or an interrupt, red for a failure) with the most frequent error codes and the next step.
+A migration started from the wizard on a terminal takes the whole terminal while it runs, on the alternate screen as `htop` or `less` do, and the normal screen comes back at the end with the result panel. From top to bottom:
+
+* **Overall**: a bar with the data copied (the total so far has a `+` while the listing runs, and there is no ETA until it ends), the speed with a sparkline, the average speed and the ETA, the listing (objects listed and chunks closed so far), the objects copied / ignored / missing / failed with the most frequent error codes, and the chunks done / running / pending / out of attempts. During the inventory the bar is the scan with its object count.
+* **Chunks being copied**: one fixed slot per worker (`--parallel`). A chunk keeps its slot from start to end, with its size class, its bar, objects, data, speed over the last ~10 s and attempt (`try 2` for a retry of its failed files). A chunk that ends stays in its slot, dimmed, with its outcome (`✔ done`, `✖ out of attempts`, `⏸ interrupted`) until the next chunk takes the slot; an empty slot says `waiting for the listing` or `idle`. When the slots do not fit, the last row says `+N more running`.
+* **Size classes** (when chunking by size class): per class, its size range and objects at once, the chunks closed so far, how many are done, running and pending, their objects and data, and how much of that data is copied. On a short screen it becomes one line.
+* **Log**: the rest of the screen, newest line at the bottom, with the local time and a colour per level: chunks listed, started and ended, each failed file with its error code, warnings, errors, the listing analysis and Ctrl+C. The last 500 lines are kept; the whole log is in the log file named in the panel's header.
+
+The result panel at the end is green for success, yellow for failed files or an interrupt and red for a failure, with the most frequent error codes and the next step. With `--repeat`, each round has its own screen and its result panel stays above the next round's.
 
 ```text
-◇  Migrating  my-bucket → files3
-│
-│  ⠹ Migrating                                           elapsed 2h 41m
-│  listing ░░░░░░░██████░░░░░░░░  3,100,000 objects listed · 190 chunk(s) so far
-│  ███████████░░░░░░░░░░░░░░░░░░░░░░░░░░           44.10 TiB / 184.20 TiB+
-│  speed 1.62 GiB/s  ▂▃▅▆▇▇▆▇   ETA after listing
-│  chunks ✔ 42  ▶ 4  144 pending  ✖ 0      copied 3,012,554   ignored 0   ✖ failed 3
-│  ▶ 00043 ███████░░░  71% ▶ 00044 ██░░░░░░░░  18% ▶ 00045 █████░░░░░  52% ▶ 00046 ░░░░░░░░░░   2%
-│  ✖ AuthorizationFailure  data/2024/big file.bin   (chunk 00009)
-│  log  runs\20261112T020000Z-migration\migration-20261112T020000Z.log
+ Migrating  my-bucket → files3                                                          ⠹ elapsed 2h 14m
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+ overall   ██████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  23.9%    44.10 TiB / 184.20 TiB+
+ speed     1.62 GiB/s  ▂▃▅▆▇▇▆▇   average 1.40 GiB/s   ETA after listing
+ listing   3,100,000 objects listed · 190 chunks so far
+ objects   copied 3,012,554 · ignored 0 · missing 0 · failed 3        errors AuthorizationFailure 3
+ chunks    ✔ 42 done · ▶ 3 running · 144 pending · ✖ 1 out of attempts
+── Chunks being copied (4 workers) ────────────────────────────────────────────────────────────────────────
+ 1 ▶ 00013 very-small ███████████░░░░  71%   71,012 / 100,000 obj    612 MiB / 860 MiB    12.3 MiB/s  try 1
+ 2 ▶ 00014 small      ███░░░░░░░░░░░░  18%    9,100 /  50,000 obj    410 GiB / 1.00 TiB    310 MiB/s  try 1
+ 3 ▶ 00015 large      ████████░░░░░░░  52%      520 /   1,000 obj   1.40 TiB / 2.70 TiB   1.10 GiB/s  try 2
+ 4 ✔ 00012 medium     ███████████████ 100%   done 4s ago · copied 10,000 · failed 0
+── Size classes ───────────────────────────────────────────────────────────────────────────────────────────
+ class       size               at once  chunks  ✔ done  ▶ run  pending   objects      data       copied
+ very-small  < 1 MiB                128     120      40      1       79   11,800,000   3.10 TiB      31%
+ small       1 MiB – < 64 MiB        64      50       2      1       47    2,400,000  48.00 TiB       5%
+ medium      64 MiB – < 1 GiB        16      15       0      0       15      140,000  60.00 TiB       0%
+ large       1 GiB – < 100 GiB        8       5       0      1        4        4,800  73.10 TiB       2%
+ very-large  ≥ 100 GiB                2       0       0      0        0            0        0 B        —
+── Log  runs\20261117T010000Z-migration\migration-20261117T010000Z.log ────────────────────────────────────
+ 03:14:07  chunk 00041 (small) listed: 50,000 objects, 1.02 TiB
+ 03:14:09  chunk 00012 (medium) success   copied 10,000  ignored 0  failed 0   640 GiB  41m 3s
+ 03:14:09  chunk 00013 (very-small) started
+ 03:14:12  ✖ chunk 00015  AuthorizationFailure  data/2024/big file.bin
+ 03:14:20  WARN chunk 00014: S3 SlowDown, retrying
 ```
 
-Narrow terminals (< 60 columns) show a compact version without the sparkline, running chunks, failures and log path, and below 36 columns a single line. Warnings are printed above the dashboard. Colours follow `NO_COLOR` / `FORCE_COLOR`, and the symbols fall back to ASCII when the terminal is not UTF-8. The log files, `migration.json` and exit codes are the same as with the plain output.
+On a screen under 60 columns or 16 rows the full screen holds the compact lines instead (below 36 columns a single line), with the log under them when rows are left. Colours follow `NO_COLOR` / `FORCE_COLOR`, and the symbols fall back to ASCII when the terminal is not UTF-8. The log files, `migration.json` and exit codes are the same as with the plain output, and `migrate` on the command line keeps the plain output.
 
 Secrets are kept **in memory only**: there is no flag for them, and nothing about them is written to `migration.json`, `state.json`, the logs, the failed-file lists or the command line. Typed AWS values are set in the environment of this process for the duration of the run (that is where the S3 client reads them) and restored afterwards; the SAS URL is passed to the command in memory. The wizard never offers to save credentials. Ctrl+C at any prompt cancels (exit code 130); during a migration it stops it as described above. Long paths and URLs are shortened in the middle to fit the terminal width. `ui` refuses to start without a terminal (exit code 64). `--output-dir` and `--dry-run` apply to the wizard too.
 

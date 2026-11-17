@@ -29,14 +29,14 @@ export function createStyle(color) {
 }
 
 const UNICODE_SYMBOLS = {
-  ok: '✔', ignored: '↷', fail: '✖', run: '▶', arrow: '→',
-  barFull: '█', barEmpty: '░', bar: '│', step: '◇', end: '◆',
+  ok: '✔', ignored: '↷', fail: '✖', run: '▶', pause: '⏸', arrow: '→',
+  barFull: '█', barEmpty: '░', bar: '│', rule: '─', step: '◇', end: '◆',
   spinner: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
   spark: ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'],
 };
 const ASCII_SYMBOLS = {
-  ok: '*', ignored: '-', fail: 'x', run: '>', arrow: '->',
-  barFull: '#', barEmpty: '.', bar: '|', step: 'o', end: '*',
+  ok: '*', ignored: '-', fail: 'x', run: '>', pause: '=', arrow: '->',
+  barFull: '#', barEmpty: '.', bar: '|', rule: '-', step: 'o', end: '*',
   spinner: ['|', '/', '-', '\\'],
   spark: ['_', '.', '-', '~', '=', '+', '*', '#'],
 };

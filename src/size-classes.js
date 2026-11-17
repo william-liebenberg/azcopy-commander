@@ -84,7 +84,7 @@ export const compareKeys = (a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buff
 const sizeText = (bytes) => formatBytes(bytes).replace(/\.00 /, ' ');
 
 /** The size range of class `i`: `< 1 MiB`, `1 MiB – < 64 MiB`, `≥ 100 GiB`. */
-function rangeText(classes, i) {
+export function rangeText(classes, i) {
   const c = classes[i];
   const from = i > 0 ? classes[i - 1].below : undefined;
   if (c.below === undefined) return from === undefined ? 'any size' : `≥ ${sizeText(from)}`;

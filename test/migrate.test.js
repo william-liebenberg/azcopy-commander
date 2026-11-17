@@ -344,6 +344,28 @@ test('MigrationProgress: while the listing runs the total has a +, and there is 
   assert.equal(later.throughput, 500);
   assert.equal(later.etaSeconds, (4000 - 2150) / 500);
   assert.match(formatAggregate(later), /^COPYING \| chunks 2\/4 done, 1 running \| copied 21 \| ignored 1 \| missing 1 \| failed 3 \| 2\.10 KiB \/ 3\.91 KiB \(53\.8%\) \| 500 B\/s \| ETA 4s$/);
+  assert.deepEqual(later.classes, [], 'uniform chunks: no size classes');
+  assert.equal(later.averageThroughput, 750 / 2, 'what this run did (chunk 2), over its 2 seconds');
+});
+
+test('MigrationProgress: the numbers of each running chunk and the totals of each size class', () => {
+  const chunks = [
+    { id: 1, sizeClass: 'small', files: 10, bytes: 1000, status: 'success', copied: 10, ignored: 0, failed: 0, bytesCopied: 1000 },
+    { id: 2, sizeClass: 'small', files: 20, bytes: 2000, status: 'running', copied: 0, ignored: 0, failed: 0, bytesCopied: 0 },
+    { id: 3, sizeClass: 'large', files: 2, bytes: 8000, status: 'exhausted', copied: 1, ignored: 0, failed: 1, bytesCopied: 4000 },
+    { id: 4, sizeClass: 'small', files: 5, bytes: 500, status: 'pending', copied: 0, ignored: 0, failed: 0, bytesCopied: 0 },
+  ];
+  let now = 0;
+  const progress = new MigrationProgress({ chunks, now: () => now });
+  progress.update(2, { copied: 6, ignored: 2, missing: 1, failed: 1, bytesDone: 500, bytesTotal: 2000, filesTotal: 20 });
+  now = 1000;
+  const s = progress.snapshot(now);
+  assert.deepEqual(s.running, [{ id: 2, sizeClass: 'small', percent: 25, filesDone: 10, filesTotal: 20, bytesDone: 500, bytesTotal: 2000, failed: 1 }]);
+  assert.deepEqual(s.classes, [
+    { name: 'small', chunks: 3, done: 1, running: 1, pending: 1, exhausted: 0, files: 35, bytes: 3500, bytesDone: 1500 },
+    { name: 'large', chunks: 1, done: 1, running: 0, pending: 0, exhausted: 1, files: 2, bytes: 8000, bytesDone: 4000 },
+  ]);
+  assert.equal(s.averageThroughput, 500, 'chunks 1 and 3 were done before this run: only chunk 2 counts');
 });
 
 // ------------------------------------------------------------- the copy of one object
@@ -432,7 +454,7 @@ test('copyChunk: counts, failed list without query strings, log with the invalid
   });
   assert.deepEqual([report.outcome, report.copied, report.ignored, report.missing, report.failed, report.bytesCopied], ['partial', 2, 1, 1, 1, 5]);
   assert.deepEqual(failures, [['b c.txt', 'AuthorizationFailure']]);
-  assert.deepEqual(snapshots.at(-1), { copied: 2, ignored: 1, missing: 1, failed: 1, bytesDone: 15, bytesTotal: 15 });
+  assert.deepEqual(snapshots.at(-1), { copied: 2, ignored: 1, missing: 1, failed: 1, bytesDone: 15, bytesTotal: 15, filesTotal: 5 });
   assert.deepEqual(readLines(report.files.failed).map((l) => JSON.parse(l)), [{ relativePath: 'b c.txt', src: `${SOURCE_BASE}/b%20c.txt`, dst: `${DEST_BASE}/b%20c.txt`, errorCode: 'AuthorizationFailure', size: 2 }]);
   const log = fs.readFileSync(report.files.log, 'utf8');
   assert.match(log, /metadata left out \(not a valid Azure metadata name\): bad-name/);

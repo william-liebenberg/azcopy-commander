@@ -10,6 +10,14 @@ const num = (v) => Number(v) || 0;
 /** Chunks that need no more work: copied, or out of attempts. */
 export const isFinished = (chunk) => chunk.status === 'success' || chunk.status === 'exhausted';
 
+/** The bytes of a chunk counted as done: all of a copied chunk, else what its attempts copied or the live attempt reached. */
+function doneBytes(c, live) {
+  if (c.status === 'success') return num(c.bytes);
+  if (!live) return Math.min(num(c.bytes), num(c.bytesCopied));
+  const fraction = num(live.bytesTotal) > 0 ? Math.min(1, num(live.bytesDone) / num(live.bytesTotal)) : 0;
+  return Math.min(num(c.bytes), Math.max(num(c.bytesCopied), fraction * num(c.bytes)));
+}
+
 /**
  * Adds up what the chunks of a migration have done, against the total of the chunks so far. While the listing runs
  * (`listing` set, with the objects listed so far) the total grows: it is shown with a `+`, and there is no ETA.
@@ -17,6 +25,10 @@ export const isFinished = (chunk) => chunk.status === 'success' || chunk.status 
  * `chunks` are the entries of migration.json, the array the orchestrator adds the closed chunks to (status, bytes of
  * the chunk, and `copied` / `ignored` / `missing` / `failed` / `bytesCopied` summed over the attempts that ended).
  * The running chunks report through `update(id, snapshot)` (see copyChunk) and are folded in on top.
+ *
+ * The snapshot also has `running` (the numbers of the attempt of each running chunk), `classes` (the totals of each
+ * size class, in the order their first chunk was closed; none for a migration with uniform chunks) and
+ * `averageThroughput` (the bytes done since this run started, over its elapsed time).
  */
 export class MigrationProgress {
   constructor({ chunks, now = Date.now }) {
@@ -26,6 +38,7 @@ export class MigrationProgress {
     this.startedAt = now();
     this.live = new Map(); // chunk id -> latest job snapshot
     this.samples = []; // [timestamp, bytes done] within WINDOW_MS
+    this.startBytes = chunks.reduce((s, c) => s + doneBytes(c, null), 0); // what earlier runs did
   }
 
   update(id, snapshot) {
@@ -46,6 +59,7 @@ export class MigrationProgress {
     let bytesDone = 0;
     let done = 0;
     const running = [];
+    const classes = new Map(); // size class name -> its totals
     for (const c of this.chunks) {
       const live = this.live.get(c.id);
       copied += num(c.copied) + num(live?.copied);
@@ -53,13 +67,35 @@ export class MigrationProgress {
       missing += num(c.missing) + num(live?.missing);
       total += num(c.bytes);
       failed += live ? num(live.failed) : num(c.failed);
-      if (c.status === 'success') bytesDone += c.bytes;
-      else if (live) {
+      const chunkDone = doneBytes(c, live);
+      bytesDone += chunkDone;
+      const isRunning = Boolean(live) && c.status !== 'success';
+      if (isRunning) {
         const fraction = num(live.bytesTotal) > 0 ? Math.min(1, num(live.bytesDone) / num(live.bytesTotal)) : 0;
-        bytesDone += Math.min(c.bytes, Math.max(num(c.bytesCopied), fraction * c.bytes));
-        running.push({ id: c.id, percent: fraction * 100, ...(c.sizeClass ? { sizeClass: c.sizeClass } : {}) });
-      } else bytesDone += Math.min(c.bytes, num(c.bytesCopied));
+        running.push({
+          id: c.id,
+          ...(c.sizeClass ? { sizeClass: c.sizeClass } : {}),
+          percent: fraction * 100,
+          filesDone: num(live.copied) + num(live.ignored) + num(live.missing) + num(live.failed),
+          filesTotal: num(live.filesTotal),
+          bytesDone: num(live.bytesDone),
+          bytesTotal: num(live.bytesTotal),
+          failed: num(live.failed),
+        });
+      }
       if (isFinished(c)) done++;
+      if (c.sizeClass) {
+        let cls = classes.get(c.sizeClass);
+        if (!cls) classes.set(c.sizeClass, (cls = { name: c.sizeClass, chunks: 0, done: 0, running: 0, pending: 0, exhausted: 0, files: 0, bytes: 0, bytesDone: 0 }));
+        cls.chunks++;
+        if (isFinished(c)) cls.done++;
+        else if (isRunning) cls.running++;
+        else cls.pending++;
+        if (c.status === 'exhausted') cls.exhausted++;
+        cls.files += num(c.files);
+        cls.bytes += num(c.bytes);
+        cls.bytesDone += chunkDone;
+      }
     }
     const last = this.samples.at(-1);
     if (!last || now - last[0] >= SAMPLE_EVERY_MS) this.samples.push([now, bytesDone]);
@@ -77,6 +113,7 @@ export class MigrationProgress {
       chunksPending: this.chunks.length - done - running.length,
       chunksExhausted: this.chunks.filter((c) => c.status === 'exhausted').length,
       running,
+      classes: [...classes.values()],
       copied,
       ignored,
       missing,
@@ -85,6 +122,7 @@ export class MigrationProgress {
       bytesTotal: total,
       percent: total > 0 ? Math.min(100, (bytesDone / total) * 100) : 0,
       throughput,
+      averageThroughput: now > this.startedAt ? Math.max(0, bytesDone - this.startBytes) / ((now - this.startedAt) / 1000) : 0,
       etaSeconds: !listing && throughput > 0 ? Math.max(0, total - bytesDone) / throughput : NaN,
       elapsedSeconds: (now - this.startedAt) / 1000,
     };
@@ -114,6 +152,26 @@ export const chunkLabel = (c) => `chunk ${chunkId(c.id)}${c.sizeClass ? ` (${c.s
 function classCounts(classes, chunks) {
   const parts = classes.map((cls) => [cls.name, chunks.filter((c) => c.sizeClass === cls.name).length]).filter(([, n]) => n > 0);
   return `by class: ${parts.length > 0 ? parts.map(([name, n]) => `${name} ${formatCount(n)}`).join(', ') : 'none'}`;
+}
+
+/** What the listing made of the chunks, when it ended (the plain output and the dashboard's log). */
+export function chunkingLines({ chunks, skipped, archived = 0, maxFiles, maxBytes, sizeClasses, chunksDir }) {
+  const carried = chunks.filter((c) => c.carried).length;
+  const split = carried > 0 ? ` (${formatCount(carried)} carried over + ${formatCount(chunks.length - carried)} from the inventory)` : '';
+  const limits = sizeClasses ? `by size class, each ≤ its files per chunk or ≤ ${formatBytes(maxBytes)}` : `≤ ${formatCount(maxFiles)} objects or ≤ ${formatBytes(maxBytes)} each`;
+  const lines = [`Listing done. Chunks: ${formatCount(chunks.length)}${split} (${limits}) in ${chunksDir}`];
+  if (sizeClasses) lines.push(`  ${classCounts(sizeClasses, chunks)}`);
+  if (skipped > 0) lines.push(`  ${formatCount(skipped)} key(s) cannot be copied (${formatCount(archived)} archived, ${formatCount(skipped - archived)} with a line break); they are listed in skipped.jsonl`);
+  return lines;
+}
+
+/** How the copy runs, when it starts (the plain output and the dashboard's log). */
+export function copyStartedLines({ chunks, parallel, concurrency, sizeClasses }) {
+  const each = sizeClasses ? 'the objects at once of its size class in each:' : `${concurrency} object(s) at once in each`;
+  return [
+    `Copying as the chunks close${chunks > 0 ? ` (${formatCount(chunks)} ready)` : ''}: ${parallel} chunk(s) at a time, ${each}`,
+    ...(sizeClasses ? sizeClassLines(sizeClasses) : []).map((l) => `  ${l}`),
+  ];
 }
 
 /** The line that says how a chunk ended. */
@@ -196,19 +254,12 @@ export class PlainMigrationView extends PlainView {
     lines.forEach((l) => this.print(`  ${l}`));
   }
 
-  chunking({ chunks, skipped, archived = 0, maxFiles, maxBytes, sizeClasses, chunksDir }) {
-    const carried = chunks.filter((c) => c.carried).length;
-    const split = carried > 0 ? ` (${formatCount(carried)} carried over + ${formatCount(chunks.length - carried)} from the inventory)` : '';
-    const limits = sizeClasses ? `by size class, each ≤ its files per chunk or ≤ ${formatBytes(maxBytes)}` : `≤ ${formatCount(maxFiles)} objects or ≤ ${formatBytes(maxBytes)} each`;
-    this.print(`Listing done. Chunks: ${formatCount(chunks.length)}${split} (${limits}) in ${chunksDir}`);
-    if (sizeClasses) this.print(`  ${classCounts(sizeClasses, chunks)}`);
-    if (skipped > 0) this.print(`  ${formatCount(skipped)} key(s) cannot be copied (${formatCount(archived)} archived, ${formatCount(skipped - archived)} with a line break); they are listed in skipped.jsonl`);
+  chunking(info) {
+    chunkingLines(info).forEach((l) => this.print(l));
   }
 
-  copyStarted({ chunks, parallel, concurrency, sizeClasses }) {
-    const each = sizeClasses ? 'the objects at once of its size class in each:' : `${concurrency} object(s) at once in each`;
-    this.print(`Copying as the chunks close${chunks > 0 ? ` (${formatCount(chunks)} ready)` : ''}: ${parallel} chunk(s) at a time, ${each}`);
-    for (const l of sizeClasses ? sizeClassLines(sizeClasses) : []) this.print(`  ${l}`);
+  copyStarted(info) {
+    copyStartedLines(info).forEach((l) => this.print(l));
   }
 
   chunkClosed(chunk) {

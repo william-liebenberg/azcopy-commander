@@ -163,7 +163,7 @@ export function createCopier({ s3, container, directory = '', prefix = '', block
  *   run.json            `manifest` with the attempt's counters and outcome
  *   copy-<ts>.log       failed and missing objects, invalid metadata names, the summary
  *   failed-<ts>.jsonl   { relativePath, src, dst, errorCode, size } per failed object (no query string: no secret)
- * `onProgress({ copied, ignored, missing, failed, bytesDone, bytesTotal })` is called as objects end (at most every
+ * `onProgress({ copied, ignored, missing, failed, bytesDone, bytesTotal, filesTotal })` is called as objects end (at most every
  * `intervalMs`) and at the end; `onFailure(path, errorCode)` for each failed object. `redact` cleans an error message before it is written.
  * Returns { outcome, copied, ignored, missing, failed, bytesCopied, files: { log, failed } }; outcome is success,
  * partial (some objects failed) or interrupted (`signal` aborted before every object ended).
@@ -182,7 +182,7 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
   const encoded = (p) => p.split('/').map(encodeURIComponent).join('/');
   const failedLines = [];
 
-  const counts = { copied: 0, ignored: 0, missing: 0, failed: 0, bytesDone: 0, bytesTotal: records.reduce((s, r) => s + (Number(r.size) || 0), 0) };
+  const counts = { copied: 0, ignored: 0, missing: 0, failed: 0, bytesDone: 0, bytesTotal: records.reduce((s, r) => s + (Number(r.size) || 0), 0), filesTotal: records.length };
   let bytesCopied = 0;
   const invalidNames = new Set();
   let lastReport = 0;
