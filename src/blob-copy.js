@@ -20,16 +20,7 @@ export const DEFAULT_BLOCK_SIZE = 256 * MiB;
 const MAX_BLOCK = 4000 * MiB;
 const MAX_BLOCKS = 50_000;
 const BLOCKS_AT_ONCE = 8;
-const MAX_COPY_SOURCE = 2048; // x-ms-copy-source is at most 2 KiB
 const METADATA_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/; // a C# identifier, as Azure requires
-
-/** An object that could not be copied: `code` is what the failed list records. */
-export class CopyError extends Error {
-  constructor(code, message) {
-    super(message);
-    this.code = code;
-  }
-}
 
 const statusOf = (err) => err?.statusCode ?? err?.$metadata?.httpStatusCode;
 const codeOf = (err) => err?.code ?? err?.details?.errorCode ?? (err?.name && err.name !== 'Error' ? err.name : undefined) ?? (statusOf(err) ? `HTTP${statusOf(err)}` : 'Error');
@@ -81,7 +72,7 @@ export const targetDirectory = (target) => new URL(target.base).pathname.split('
 
 /**
  * The function that copies one object: `copy(record, { signal })` resolves to `{ result, bytes, invalidMetadata }`
- * or rejects with a CopyError (or an SDK error).
+ * or rejects with the error of S3 or Azure.
  *   s3          see src/s3.js (headObject, presignGet)
  *   container   a ContainerClient (or a fake with getBlockBlobClient)
  *   prefix      the source prefix: the S3 key is `<prefix>/<path>`; the blob name is `<directory>/<prefix>/<path>`
@@ -89,11 +80,6 @@ export const targetDirectory = (target) => new URL(target.base).pathname.split('
 export function createCopier({ s3, container, directory = '', prefix = '', blockSize = DEFAULT_BLOCK_SIZE, overwriteModified = false }) {
   const keyOf = (p) => (prefix ? `${prefix}/${p}` : p);
   const blobName = (p) => [directory, prefix, p].filter(Boolean).join('/');
-  const presign = async (key) => {
-    const url = await s3.presignGet(key);
-    if (url.length > MAX_COPY_SOURCE) throw new CopyError('SourceUrlTooLong', `The presigned URL is ${url.length} characters; Azure takes at most ${MAX_COPY_SOURCE}.`);
-    return url;
-  };
 
   return async function copy(record, { signal } = {}) {
     const key = keyOf(record.path);
@@ -109,7 +95,7 @@ export function createCopier({ s3, container, directory = '', prefix = '', block
     const write = async (conditions) => {
       const options = { ...base, conditions };
       if (size === 0) await blob.upload('', 0, options);
-      else await blob.syncUploadFromURL(await presign(key), { ...options, copySourceBlobProperties: false });
+      else await blob.syncUploadFromURL(await s3.presignGet(key), { ...options, copySourceBlobProperties: false });
     };
 
     if (size <= blockSize) {
@@ -146,7 +132,7 @@ export function createCopier({ s3, container, directory = '', prefix = '', block
     const ids = [];
     for (let offset = 0, i = 0; offset < size; offset += each, i++) ids.push({ id: blockId(i), offset, count: Math.min(each, size - offset) });
     for (let i = 0; i < ids.length; i += BLOCKS_AT_ONCE) {
-      await Promise.all(ids.slice(i, i + BLOCKS_AT_ONCE).map(async (b) => blob.stageBlockFromURL(b.id, await presign(key), b.offset, b.count, { abortSignal: signal })));
+      await Promise.all(ids.slice(i, i + BLOCKS_AT_ONCE).map(async (b) => blob.stageBlockFromURL(b.id, await s3.presignGet(key), b.offset, b.count, { abortSignal: signal })));
     }
     try {
       await blob.commitBlockList(ids.map((b) => b.id), { ...base, conditions });

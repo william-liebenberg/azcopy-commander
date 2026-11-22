@@ -11,7 +11,7 @@ import { UsageError } from '../src/errors.js';
 import { analyseInventory, analysisLines, s3Provider } from '../src/inventory.js';
 import { MigrationProgress, formatAggregate } from '../src/migration-view.js';
 import { collectCarried, listMigrations, migrateCommand, readMigration } from '../src/migration.js';
-import { copyChunk, createCopier, CopyError } from '../src/blob-copy.js';
+import { copyChunk, createCopier } from '../src/blob-copy.js';
 import { readState, saveState, stateKey } from '../src/state.js';
 import { fakeContainer, fakeS3, httpError, PRESIGN_SECRET } from './fakes.js';
 
@@ -474,11 +474,12 @@ test('copier: above the block size, staged blocks with ids of equal length, then
   assert.deepEqual(container.requests.map((r) => r.request), ['properties']);
 });
 
-test('copier: a presigned URL longer than 2 KiB fails with SourceUrlTooLong without calling Azure', async () => {
+test('copier: a presigned URL longer than 2 KiB is sent to Azure', async () => {
   const { s3, container, copy } = copier({ 'data/a.txt': { size: 10 } });
   s3.longUrl = () => true;
-  await assert.rejects(copy({ path: 'a.txt' }), (e) => e instanceof CopyError && e.code === 'SourceUrlTooLong');
-  assert.equal(container.requests.length, 0);
+  assert.equal((await copy({ path: 'a.txt' })).result, 'copied');
+  assert.deepEqual(container.requests.map((r) => r.request), ['put']); // one Put Blob From URL
+  assert.equal(container.blobs.get('data/a.txt').size, 10);
 });
 
 test('copyChunk: counts, failed list without query strings, log with the invalid metadata names, run.json', async () => {

@@ -119,8 +119,8 @@ from a presigned GET URL:
   `Cache-Control` and the S3 user metadata are copied. A metadata name that is not valid in Azure (it must be a C#
   identifier, so not `original-filename`) is left out and logged once per chunk.
 - **Presigned URLs** are made per request (per block for large objects), expire after one hour, and are never logged or
-  written down. A URL longer than the 2 KiB Azure accepts as a copy source (usually because of a long
-  `AWS_SESSION_TOKEN`) fails the object with `SourceUrlTooLong`.
+  written down. Azure documents at most 2 KiB for a copy source; the tool does not check the length, so if Azure
+  rejects a long URL (usually because of a long `AWS_SESSION_TOKEN`), the object fails with Azure's error code.
 
 Each object ends as one of:
 
@@ -291,7 +291,8 @@ Secrets typed in the wizard stay in memory for the run only; the wizard never of
 - **The bucket must be readable from Azure with a presigned URL**: a bucket policy that limits access by source IP or
   VPC endpoint makes every copy fail with an authorization error.
 - **Temporary credentials**: a presigned URL is valid at most as long as its session token, and a long token can make
-  the URL too long (`SourceUrlTooLong`). Prefer the keys of an IAM user for a long migration.
+  the URL longer than the 2 KiB Azure documents for a copy source. Prefer the keys of an IAM user for a long
+  migration: they keep URLs short.
 - **SAS expiry**: make sure the SAS outlives the migration (the tool warns when it expires in less than 7 days).
   Continuing a migration asks for the SAS again; it must target the same container.
 - **Disk**: chunks run on this machine only. The chunk files of 10 to 100 million objects take a few GB on disk.
