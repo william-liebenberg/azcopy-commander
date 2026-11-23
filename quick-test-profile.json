@@ -1,0 +1,9 @@
+{
+  "classes": [
+    { "name": "very-small", "below": "1MiB", "chunkFiles": 100, "concurrency": 32 },
+    { "name": "small", "below": "64MiB", "chunkFiles": 50, "concurrency": 16 },
+    { "name": "medium", "below": "1GiB", "chunkFiles": 10, "concurrency": 8 },
+    { "name": "large", "below": "100GiB", "chunkFiles": 5, "concurrency": 4 },
+    { "name": "very-large", "chunkFiles": 2, "concurrency": 2 }
+  ]
+}
