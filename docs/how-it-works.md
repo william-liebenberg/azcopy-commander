@@ -138,6 +138,21 @@ One failed object does not fail the others.
 Each copy of a chunk is an **attempt**, a folder `chunks/00007/<timestamp>-chunk/` with `run.json`, `copy-<ts>.log` and
 `failed-<ts>.jsonl`.
 
+`run.json` and `copy-<ts>.log` include the attempt's **throughput**, to tune `--concurrency`, `--parallel`, the size
+classes and `--block-size` by hand. It is measured two ways, from the moments objects end:
+
+- over 10 s windows of the attempt (the window of the dashboard's chunk speed): min and max, and the average, which is
+  the bytes copied divided by the attempt's time. A window in which no object ends counts as 0 B/s; the last,
+  incomplete window is left out. Bytes count only when an object ends, so in the `large` and `very-large` classes the
+  window min is often 0 and the max a spike: read the per-object rates there.
+- per copied object of more than 0 bytes: its size divided by the time of its copy (S3 HEAD, presign and the Azure
+  write or blocks), min, avg and max.
+
+In `run.json` the figures are in bytes per second (`throughput: { seconds, bytesPerSecond, windowSeconds, windows: {
+count, min, max }, objects: { count, min, avg, max } }`); `windows` is left out when the attempt lasted less than 10 s,
+and `throughput` is null when nothing was copied. The migration log and the chunk end line of the plain output show them as
+text; the dashboard's log shows them on a line of their own after the chunk end line.
+
 - A chunk with no failed object is `success`.
 - With failed objects it is `partial`, and the next attempt copies just those.
 - An `interrupted` or `failed` attempt copies the whole chunk again; objects already at the target are ignored at the
@@ -177,8 +192,8 @@ runs/state.json                        the start of the last successful migratio
 ```
 
 - `migration.json` holds the options (with the size classes), the listing position, and one entry per chunk (status,
-  attempts, files, bytes, size class, counters). A delta also records its date, its baseline and its carried files. It
-  is written atomically.
+  attempts, files, bytes, size class, counters, the last attempt's throughput). A delta also records its date, its
+  baseline and its carried files. It is written atomically.
 - `chunks/<id>.jsonl` is the inventory: one object per line, path relative to the prefix. JSON lines, because S3 keys
   may contain tabs.
 - `chunks/skipped.jsonl` lists keys that are not copied: keys with a line break, and archived objects (`GLACIER`,
@@ -262,6 +277,7 @@ panel (green for success, yellow for failed files or an interrupt, red for a fai
 ── Log  runs\20261117T010000Z-migration\migration-20261117T010000Z.log ────────────────────────────────────
  03:14:07  chunk 00041 (small) listed: 50,000 objects, 1.02 TiB
  03:14:09  chunk 00012 (medium) success   copied 10,000  ignored 0  failed 0   640 GiB  41m 3s
+ 03:14:09  chunk 00012 (medium) throughput 266.08 MiB/s (10 s min 0 B/s, max 1.12 GiB/s; per objec…x 61.00 MiB/s)
  03:14:09  chunk 00013 (very-small) started
  03:14:12  ✖ chunk 00015  AuthorizationFailure  data/2024/big file.bin
  03:14:20  WARN chunk 00014: S3 SlowDown, retrying
@@ -283,7 +299,8 @@ Secrets typed in the wizard stay in memory for the run only; the wizard never of
 - **Throughput** comes from the number of copy requests in flight: `--parallel` × the objects at once of the chunks
   being copied. Azure does the copying; this machine only sends requests and waits. For many small objects, raise the
   `concurrency` of the small classes in a profile (or `--concurrency` for uniform chunks). The defaults are a starting
-  point: watch for throttling from S3 or Azure on a real run, and lower them if needed.
+  point: watch for throttling from S3 or Azure on a real run, and lower them if needed. The throughput of each chunk
+  attempt (see [Failures, retries and Ctrl+C](#failures-retries-and-ctrlc)) shows the effect of a change.
 - **Start-up**: the first chunk closes after its class's files per chunk or `--chunk-minutes`, so copying starts within
   minutes. The total size and the ETA are known only when the listing ends.
 - **Not copied**: keys with a line break, archived objects that are not restored (restore them, then run a delta), and

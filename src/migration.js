@@ -13,6 +13,7 @@ import { concurrencyText, DEFAULT_SIZE_CLASSES, readSizeProfile, sizeClassLines 
 import { containerFor, copyChunk, createCopier, DEFAULT_BLOCK_SIZE, targetDirectory } from './blob-copy.js';
 import { withS3 } from './s3.js';
 import { writeFileAtomic } from './files.js';
+import { throughputText } from './throughput.js';
 import { ChunkView, deltaLines, formatAggregate, isFinished, MigrationProgress, PlainMigrationView } from './migration-view.js';
 
 /*
@@ -27,7 +28,8 @@ import { ChunkView, deltaLines, formatAggregate, isFinished, MigrationProgress, 
  * migration.json (`format: 2`) is the record: the options, the state of the listing (`inventory`: status, the
  * positions `listedThrough`, `closedThrough` (per class) and `resumeAfter` (see ChunkWriter), counts of closed chunks,
  * the size of skipped.jsonl) and one entry per chunk
- * ({ id, list, files, bytes, sizeClass?, status, attempts, runs, copied, ignored, missing, failed, bytesCopied, carried? }).
+ * ({ id, list, files, bytes, sizeClass?, status, attempts, runs, copied, ignored, missing, failed, bytesCopied, throughput?, carried? }).
+ * `throughput` is the last attempt's (see throughput.js), left out when it copied nothing.
  * A migration continued lists again from `resumeAfter` (S3 lists keys in order), after deleting the open chunks, and
  * leaves out what was already recorded. An `inventory` with `resumeAfter` alone (before size classes) reads as
  * `listedThrough` and every `closedThrough` equal to it.
@@ -732,7 +734,10 @@ async function runOneMigration(opts, out) {
           chunk.failed = report.failed;
         }
         chunk.status = outcome;
-        log('INFO', `chunk ${chunkId(chunk.id)} attempt ${chunk.attempts}: ${outcome} (copied ${report.copied}, ignored ${report.ignored}, missing ${report.missing}, failed ${report.failed})`);
+        if (report.throughput) chunk.throughput = report.throughput;
+        else delete chunk.throughput;
+        const throughput = report.throughput ? `; throughput ${throughputText(report.throughput)}` : '';
+        log('INFO', `chunk ${chunkId(chunk.id)} attempt ${chunk.attempts}: ${outcome} (copied ${report.copied}, ignored ${report.ignored}, missing ${report.missing}, failed ${report.failed})${throughput}`);
         if (outcome === 'success') {
           chunk.failed = 0;
           break;

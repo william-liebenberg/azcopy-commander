@@ -2,6 +2,7 @@ import { PlainView } from './view.js';
 import { formatBytes, formatCount, formatDuration } from './format.js';
 import { chunkId } from './chunks.js';
 import { sizeClassLines } from './size-classes.js';
+import { throughputText } from './throughput.js';
 
 const WINDOW_MS = 60_000; // throughput is averaged over the last minute, as for one job
 const SAMPLE_EVERY_MS = 500;
@@ -174,9 +175,9 @@ export function copyStartedLines({ chunks, parallel, concurrency, sizeClasses })
   ];
 }
 
-/** The line that says how a chunk ended. */
-export function chunkEndLine(c) {
-  return `${chunkLabel(c)} ${c.status}   copied ${formatCount(c.copied)}  ignored ${formatCount(c.ignored)}  ${num(c.missing) > 0 ? `missing ${formatCount(c.missing)}  ` : ''}failed ${formatCount(c.failed)}   ${formatBytes(c.bytesCopied)}  ${formatDuration(c.seconds ?? 0)}`;
+/** The line that says how a chunk ended, with its last attempt's throughput unless `throughput` is false. */
+export function chunkEndLine(c, { throughput = true } = {}) {
+  return `${chunkLabel(c)} ${c.status}   copied ${formatCount(c.copied)}  ignored ${formatCount(c.ignored)}  ${num(c.missing) > 0 ? `missing ${formatCount(c.missing)}  ` : ''}failed ${formatCount(c.failed)}   ${formatBytes(c.bytesCopied)}  ${formatDuration(c.seconds ?? 0)}${throughput && c.throughput ? `   ${throughputText(c.throughput)}` : ''}`;
 }
 
 const TITLES = { success: 'Migration completed', partial: 'Migration completed with failed files', failed: 'Migration failed', interrupted: 'Migration interrupted', stopped: 'Migration stopped' };

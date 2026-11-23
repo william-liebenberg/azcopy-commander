@@ -11,6 +11,7 @@ import * as realCommands from '../src/commands.js';
 import * as realMigration from '../src/migration.js';
 import { MigrationDashboard, renderMigrationDashboard } from '../src/ui/migration-dashboard.js';
 import { renderMigrationScreen } from '../src/ui/migration-screen.js';
+import { chunkEndLine } from '../src/migration-view.js';
 import { DEFAULT_SIZE_CLASSES } from '../src/size-classes.js';
 import { fakeContainer, fakeS3, PRESIGN_SECRET } from './fakes.js';
 
@@ -912,6 +913,14 @@ test('MigrationDashboard: the inventory phase lasts until the first chunk is clo
   stopAfter.close();
 });
 
+test('chunkEndLine: the last attempt\'s throughput, when the chunk has one', () => {
+  const c = { id: 12, sizeClass: 'medium', status: 'success', copied: 10000, ignored: 0, failed: 0, bytesCopied: 2 ** 20, seconds: 63 };
+  assert.equal(chunkEndLine(c), 'chunk 00012 (medium) success   copied 10,000  ignored 0  failed 0   1.00 MiB  1m 3s');
+  c.throughput = { seconds: 63, bytesPerSecond: 16644, windowSeconds: 10, objects: { count: 10000, min: 1024, avg: 2048, max: 4096 } };
+  assert.equal(chunkEndLine(c), 'chunk 00012 (medium) success   copied 10,000  ignored 0  failed 0   1.00 MiB  1m 3s   16.25 KiB/s (per object min 1.00 KiB/s, avg 2.00 KiB/s, max 4.00 KiB/s)');
+  assert.equal(chunkEndLine(c, { throughput: false }), 'chunk 00012 (medium) success   copied 10,000  ignored 0  failed 0   1.00 MiB  1m 3s');
+});
+
 test('MigrationDashboard: slots never move; an ended chunk shows its outcome until the next chunk takes its slot', async () => {
   let now = 0;
   const { term, dash } = await copyingDashboard({ parallel: 3, now: () => now });
@@ -924,14 +933,15 @@ test('MigrationDashboard: slots never move; an ended chunk shows its outcome unt
   dash.chunkStarted(3, c3);
   assert.deepEqual(ids(), [1, 2, 3]);
 
-  Object.assign(c2, { status: 'success', copied: 100, failed: 0, bytesCopied: 1000 });
+  Object.assign(c2, { status: 'success', copied: 100, failed: 0, bytesCopied: 1000, throughput: { seconds: 4, bytesPerSecond: 250, windowSeconds: 10, objects: { count: 100, min: 10, avg: 20, max: 30 } } });
   now = 4000;
   dash.chunkEnded(c2);
   assert.deepEqual(ids(), [1, 2, 3], 'an ended chunk stays in its slot');
   await flush();
   let rows = frameRows(unsync(term.writes.at(-1)));
   assert.ok(rows.some((r) => /^ 2 ✔ 00002 small █+ 100% {3}done 0s ago · copied 100 · failed 0$/.test(r)), rows.join('\n'));
-  assert.ok(rows.some((r) => r.includes('chunk 00002 (small) success')), 'the end is in the log');
+  assert.ok(rows.some((r) => r.includes('chunk 00002 (small) success') && !r.includes('B/s')), 'the end is in the log');
+  assert.ok(rows.some((r) => r.endsWith('chunk 00002 (small) throughput 250 B/s (per object min 10 B/s, avg 20 B/s, max 30 B/s)')), 'its throughput on the next line');
 
   dash.chunkStarted(4, c4);
   assert.deepEqual(ids(), [1, 4, 3], 'chunk 4 takes the free slot 2; slots 1 and 3 do not move');

@@ -1,5 +1,6 @@
 import { formatBytes, formatCount } from '../format.js';
 import { chunkEndLine, chunkingLines, chunkLabel, copyStartedLines, migrationTitle } from '../migration-view.js';
+import { throughputText } from '../throughput.js';
 import { chunkId } from '../chunks.js';
 import { createStyle, symbolsFor, visible } from './style.js';
 import { clamp, compactDuration, compose, Dashboard, duration, HISTORY, NARROW_MIN, progressBar, rate, scanningBar } from './dashboard.js';
@@ -269,7 +270,9 @@ export class MigrationDashboard extends Dashboard {
   chunkEnded(chunk) {
     const slot = this.slots.find((s) => s?.chunk.id === chunk.id && s.endedAt === undefined);
     if (slot) Object.assign(slot, { chunk, endedAt: this.now(), outcome: chunk.status });
-    this.addLog(chunk.status === 'success' ? 'INFO' : chunk.status === 'interrupted' ? 'WARN' : 'ERROR', chunkEndLine(chunk));
+    // The throughput on a line of its own: the log panel shortens a long line in its middle, which would hide the counts.
+    this.addLog(chunk.status === 'success' ? 'INFO' : chunk.status === 'interrupted' ? 'WARN' : 'ERROR', chunkEndLine(chunk, { throughput: false }));
+    if (chunk.throughput) this.addLog('INFO', `${chunkLabel(chunk)} throughput ${throughputText(chunk.throughput)}`);
     this.draw();
   }
 

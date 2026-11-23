@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadSdk } from './sdk.js';
 import { fileTimestamp } from './format.js';
+import { ThroughputMeter, throughputText } from './throughput.js';
 
 /*
  * The copy of S3 objects to a blob container, server-side: Azure reads each object from a presigned S3 GET URL.
@@ -151,10 +152,12 @@ export function createCopier({ s3, container, directory = '', prefix = '', block
  *   failed-<ts>.jsonl   { relativePath, src, dst, errorCode, size } per failed object (no query string: no secret)
  * `onProgress({ copied, ignored, missing, failed, bytesDone, bytesTotal, filesTotal })` is called as objects end (at most every
  * `intervalMs`) and at the end; `onFailure(path, errorCode)` for each failed object. `redact` cleans an error message before it is written.
- * Returns { outcome, copied, ignored, missing, failed, bytesCopied, files: { log, failed } }; outcome is success,
- * partial (some objects failed) or interrupted (`signal` aborted before every object ended).
+ * The attempt's throughput (see throughput.js, timed with `now`) is in run.json, the log and the report.
+ * Returns { outcome, copied, ignored, missing, failed, bytesCopied, throughput, files: { log, failed } }; outcome is success,
+ * partial (some objects failed) or interrupted (`signal` aborted before every object ended); throughput is null when
+ * nothing was copied.
  */
-export async function copyChunk({ records, concurrency, signal, copy, runDir, manifest = {}, sourceBase, destBase, onProgress, onFailure, redact = String, intervalMs = 250 }) {
+export async function copyChunk({ records, concurrency, signal, copy, runDir, manifest = {}, sourceBase, destBase, onProgress, onFailure, redact = String, intervalMs = 250, now = Date.now }) {
   fs.mkdirSync(runDir, { recursive: true });
   const stamp = fileTimestamp();
   const logFile = path.join(runDir, `copy-${stamp}.log`);
@@ -178,6 +181,8 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
     onProgress({ ...counts });
   };
 
+  const meter = new ThroughputMeter({ startedAt: now() });
+  let throughput = null;
   const startedAt = new Date().toISOString();
   writeManifest({ ...manifest, startedAt, files: records.length, outcome: 'running' });
   log('INFO', `copying ${records.length} object(s), ${concurrency} at a time`);
@@ -189,10 +194,14 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
       const record = records[next++];
       const size = Number(record.size) || 0;
       try {
+        const began = now();
         const { result, bytes, invalidMetadata = [] } = await copy(record, { signal });
         invalidMetadata.forEach((n) => invalidNames.add(n));
         counts[result]++;
-        if (result === 'copied') bytesCopied += bytes;
+        if (result === 'copied') {
+          bytesCopied += bytes;
+          meter.object(bytes, began, now());
+        }
         if (result === 'missing') log('WARN', `missing at the source (deleted after the listing): ${record.path}`);
         counts.bytesDone += size;
         ended++;
@@ -217,8 +226,10 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
     if (invalidNames.size > 0) log('WARN', `metadata left out (not a valid Azure metadata name): ${[...invalidNames].sort().join(', ')}`);
     const outcome = ended < records.length ? 'interrupted' : counts.failed > 0 ? 'partial' : 'success';
     log('INFO', `${outcome}: copied ${counts.copied}, ignored ${counts.ignored} (already at the target), missing ${counts.missing}, failed ${counts.failed}`);
+    throughput = meter.finish(now());
+    if (throughput) log('INFO', `throughput ${throughputText(throughput)}`);
     flushLog();
-    writeManifest({ ...manifest, startedAt, finishedAt: new Date().toISOString(), files: records.length, outcome, copied: counts.copied, ignored: counts.ignored, missing: counts.missing, failed: counts.failed, bytesCopied });
+    writeManifest({ ...manifest, startedAt, finishedAt: new Date().toISOString(), files: records.length, outcome, copied: counts.copied, ignored: counts.ignored, missing: counts.missing, failed: counts.failed, bytesCopied, throughput });
     report(true);
   }
   const outcome = ended < records.length ? 'interrupted' : counts.failed > 0 ? 'partial' : 'success';
@@ -229,6 +240,7 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
     missing: counts.missing,
     failed: counts.failed,
     bytesCopied,
+    throughput,
     files: { log: logFile, failed: failedLines.length > 0 ? failedFile : null },
   };
 }

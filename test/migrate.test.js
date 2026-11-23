@@ -12,6 +12,7 @@ import { analyseInventory, analysisLines, s3Provider } from '../src/inventory.js
 import { MigrationProgress, formatAggregate } from '../src/migration-view.js';
 import { collectCarried, listMigrations, migrateCommand, readMigration } from '../src/migration.js';
 import { copyChunk, createCopier } from '../src/blob-copy.js';
+import { ThroughputMeter, throughputText } from '../src/throughput.js';
 import { readState, saveState, stateKey } from '../src/state.js';
 import { fakeContainer, fakeS3, httpError, PRESIGN_SECRET } from './fakes.js';
 
@@ -482,6 +483,42 @@ test('copier: a presigned URL longer than 2 KiB is sent to Azure', async () => {
   assert.equal(container.blobs.get('data/a.txt').size, 10);
 });
 
+test('ThroughputMeter: 10 s windows (empty ones at 0, the incomplete last one left out) and per-object rates', () => {
+  const MiB = 2 ** 20;
+  const meter = new ThroughputMeter({ startedAt: 1000 });
+  meter.object(10 * MiB, 1000, 3000); // ends in window 0: 5 MiB/s
+  meter.object(30 * MiB, 2000, 8000); // window 0: 5 MiB/s
+  meter.object(0, 8000, 8000); // zero bytes: left out
+  // window 1 (11-21 s): nothing ends
+  meter.object(20 * MiB, 20000, 22000); // window 2: 10 MiB/s
+  meter.object(50 * MiB, 30000, 35000); // window 3, incomplete at the end (31-36 s): 10 MiB/s
+  const t = meter.finish(36000);
+  assert.deepEqual(t, {
+    seconds: 35,
+    bytesPerSecond: Math.round((110 * MiB) / 35),
+    windowSeconds: 10,
+    windows: { count: 3, min: 0, max: 4 * MiB }, // windows 0 and 2: 40 MiB and 20 MiB over 10 s
+    objects: { count: 4, min: 5 * MiB, avg: 7.5 * MiB, max: 10 * MiB },
+  });
+
+  const short = new ThroughputMeter({ startedAt: 0 });
+  short.object(100, 0, 0); // an instant copy counts as 1 ms
+  assert.deepEqual(short.finish(4000), { seconds: 4, bytesPerSecond: 25, windowSeconds: 10, objects: { count: 1, min: 100000, avg: 100000, max: 100000 } });
+
+  const none = new ThroughputMeter({ startedAt: 0 });
+  none.object(0, 0, 5);
+  assert.equal(none.finish(60000), null, 'nothing copied');
+});
+
+test('throughputText: the average, then the window and per-object figures it has', () => {
+  const MiB = 2 ** 20;
+  const t = { seconds: 41.2, bytesPerSecond: 48.2 * MiB, windowSeconds: 10, windows: { count: 4, min: 0, max: 112 * MiB }, objects: { count: 3, min: 1.2 * MiB, avg: 5.4 * MiB, max: 30.1 * MiB } };
+  assert.equal(throughputText(t), '48.20 MiB/s (10 s min 0 B/s, max 112.00 MiB/s; per object min 1.20 MiB/s, avg 5.40 MiB/s, max 30.10 MiB/s)');
+  assert.equal(throughputText({ ...t, windows: undefined }), '48.20 MiB/s (per object min 1.20 MiB/s, avg 5.40 MiB/s, max 30.10 MiB/s)');
+  assert.equal(throughputText({ ...t, objects: undefined }), '48.20 MiB/s (10 s min 0 B/s, max 112.00 MiB/s)');
+  assert.equal(throughputText(null), '');
+});
+
 test('copyChunk: counts, failed list without query strings, log with the invalid metadata names, run.json', async () => {
   const { s3, container, copy } = copier({ 'data/a.txt': { size: 1, metadata: { 'bad-name': '1' } }, 'data/b c.txt': { size: 2 }, 'data/c.txt': { size: 3 }, 'data/d.txt': { size: 4 } });
   container.seed('data/c.txt');
@@ -489,6 +526,7 @@ test('copyChunk: counts, failed list without query strings, log with the invalid
   const runDir = path.join(tmp('chunk'), 'run');
   const snapshots = [];
   const failures = [];
+  let clock = 0;
   const report = await copyChunk({
     records: [{ path: 'a.txt', size: 1 }, { path: 'b c.txt', size: 2 }, { path: 'c.txt', size: 3 }, { path: 'd.txt', size: 4 }, { path: 'gone.txt', size: 5 }],
     concurrency: 2,
@@ -499,17 +537,21 @@ test('copyChunk: counts, failed list without query strings, log with the invalid
     destBase: DEST_BASE,
     onProgress: (s) => snapshots.push(s),
     onFailure: (p, code) => failures.push([p, code]),
+    now: () => (clock += 100),
   });
   assert.deepEqual([report.outcome, report.copied, report.ignored, report.missing, report.failed, report.bytesCopied], ['partial', 2, 1, 1, 1, 5]);
+  assert.equal(report.throughput.objects.count, 2, 'the copied objects alone: a.txt and d.txt');
+  assert.ok(report.throughput.seconds > 0 && report.throughput.bytesPerSecond > 0 && !report.throughput.windows, JSON.stringify(report.throughput));
   assert.deepEqual(failures, [['b c.txt', 'AuthorizationFailure']]);
   assert.deepEqual(snapshots.at(-1), { copied: 2, ignored: 1, missing: 1, failed: 1, bytesDone: 15, bytesTotal: 15, filesTotal: 5 });
   assert.deepEqual(readLines(report.files.failed).map((l) => JSON.parse(l)), [{ relativePath: 'b c.txt', src: `${SOURCE_BASE}/b%20c.txt`, dst: `${DEST_BASE}/b%20c.txt`, errorCode: 'AuthorizationFailure', size: 2 }]);
   const log = fs.readFileSync(report.files.log, 'utf8');
   assert.match(log, /metadata left out \(not a valid Azure metadata name\): bad-name/);
   assert.match(log, /missing at the source .*gone\.txt/);
-  assert.match(log, /partial: copied 2, ignored 1 \(already at the target\), missing 1, failed 1/);
+  assert.match(log, /partial: copied 2, ignored 1 \(already at the target\), missing 1, failed 1\n.* INFO  throughput \d+ B\/s \(per object min /);
   const manifest = JSON.parse(fs.readFileSync(path.join(runDir, 'run.json'), 'utf8'));
   assert.deepEqual([manifest.kind, manifest.outcome, manifest.files, manifest.copied, manifest.failed], ['chunk', 'partial', 5, 2, 1]);
+  assert.deepEqual(manifest.throughput, report.throughput);
   assert.ok(!/X-Amz|PRESIGN/.test(log + fs.readFileSync(report.files.failed, 'utf8')));
   assert.equal(s3.heads.length, 5);
 });
@@ -555,6 +597,11 @@ test('migrate: list into chunks and copy them; every object at its name and size
   // one attempt folder per chunk, with its files
   const run = path.join(mdir, m.chunks[0].runs[0]);
   assert.ok(fs.existsSync(path.join(run, 'run.json')) && fs.readdirSync(run).some((f) => /^copy-.*\.log$/.test(f)));
+  // the last attempt's throughput: on the chunk entry, in the migration log and on the chunk end line
+  assert.ok(m.chunks.every((c) => (c.bytesCopied > 0 ? c.throughput?.objects.count > 0 : c.throughput === undefined)), JSON.stringify(m.chunks));
+  const migrationLog = fs.readFileSync(path.join(mdir, fs.readdirSync(mdir).find((f) => /^migration-.*\.log$/.test(f))), 'utf8');
+  assert.match(migrationLog, /attempt 1: success \(copied \d+, ignored 0, missing 0, failed 0\); throughput [\d.]+ \w*B\/s \(per object min /);
+  assert.match(out.text(), /success {3}copied \d+ .* \w*B\/s \(per object min /);
 
   const state = readState(path.join(dir, 'state.json'));
   assert.equal(state[stateKey(SOURCE_BASE, DEST_BASE)].runDir, mdir);
