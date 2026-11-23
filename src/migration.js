@@ -473,7 +473,8 @@ async function runOneMigration(opts, out) {
   requireAwsCredentials(redactor);
   const maxSockets = options.parallel * maxConcurrency(options) + 8; // every copy request in flight, in one process or spread over them
   const s3 = await withS3(opts, { bucket: m.bucket, region: m.region || undefined, maxSockets }, stopAfter ? ['listPage'] : undefined);
-  const { container, directory } = stopAfter ? {} : opts.container ? { container: opts.container, directory: targetDirectory(target) } : await containerFor(target);
+  const azure = stopAfter ? {} : opts.container ? { container: opts.container, directory: targetDirectory(target) } : await containerFor(target, { maxFreeSockets: maxSockets });
+  const { container, directory } = azure;
 
   fs.mkdirSync(dir, { recursive: true });
   const view = opts.makeView?.({ delta: Boolean(m.includeAfter), round: opts.round }) ?? opts.view ?? new PlainMigrationView(out);
@@ -837,6 +838,7 @@ async function runOneMigration(opts, out) {
     logStream.end();
     await new Promise((resolve) => logStream.once('close', resolve));
     s3.destroy?.();
+    azure.destroy?.();
   }
 }
 

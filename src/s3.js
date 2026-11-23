@@ -31,13 +31,15 @@ async function bucketRegion(sdk, client, bucket) {
 }
 
 /**
- * The real S3 access, with the AWS SDK. `maxSockets` sizes the HTTPS agent (the SDK's default of 50 would queue
- * most HEAD requests when many objects are copied at once). Without `region` the bucket's region is looked up,
- * unless `lookupRegion` is false (a listing only: the SDK follows the region redirects itself).
+ * The real S3 access, with the AWS SDK. `maxSockets` sizes the HTTPS agent: the connections open at once (the SDK's
+ * default of 50 would queue most HEAD requests when many objects are copied at once), and the idle ones kept for the
+ * next requests (Node's default of 256 closes the others and opens them again, a TLS handshake each). Without `region`
+ * the bucket's region is looked up, unless `lookupRegion` is false (a listing only: the SDK follows the region
+ * redirects itself).
  */
 export async function createS3({ bucket, region, maxSockets = 50, lookupRegion = true }) {
   const sdk = await loadSdk('@aws-sdk/client-s3');
-  const requestHandler = { httpsAgent: { keepAlive: true, maxSockets } };
+  const requestHandler = { httpsAgent: { keepAlive: true, maxSockets, maxFreeSockets: maxSockets } };
   const make = (r) => new sdk.S3Client({ region: r, followRegionRedirects: true, requestHandler });
   let resolved = region || '';
   if (!resolved && lookupRegion) resolved = await bucketRegion(sdk, make(process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1'), bucket);

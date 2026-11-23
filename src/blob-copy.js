@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import { loadSdk } from './sdk.js';
 import { fileTimestamp } from './format.js';
@@ -57,15 +59,26 @@ export const blockId = (i) => Buffer.from(String(i).padStart(6, '0')).toString('
 /** The block size for an object: at least `blockSize`, large enough for at most 50,000 blocks, at most 4,000 MiB. */
 export const blockSizeFor = (size, blockSize) => Math.min(MAX_BLOCK, Math.max(blockSize, Math.ceil(size / MAX_BLOCKS)));
 
+/** A proxy set in the environment: the Azure SDK reads these variables itself, but uses no proxy with an agent of ours. */
+const proxyInEnvironment = () => ['HTTPS_PROXY', 'ALL_PROXY', 'HTTP_PROXY'].some((n) => process.env[n] || process.env[n.toLowerCase()]);
+
 /**
  * The target container of a SAS URL (see parseTargetSasUrl): the first path segment is the container, the rest a
- * directory the blobs are written under. Returns { container, directory } (`container` is a ContainerClient).
+ * directory the blobs are written under. Returns { container, directory, destroy } (`container` is a ContainerClient,
+ * `destroy()` closes its connections).
+ * `maxFreeSockets` is the number of idle connections kept for the next requests: the requests in flight, or Node's
+ * default of 256 closes the others and opens them again (a TLS handshake each). The agent still opens a connection for
+ * each request in flight, as the SDK's own does. With a proxy in the environment, the SDK's agent is kept: it is the
+ * one that goes through the proxy.
  */
-export async function containerFor(target) {
+export async function containerFor(target, { maxFreeSockets } = {}) {
   const url = new URL(target.base);
   const name = decodeURIComponent(url.pathname.split('/').filter(Boolean)[0]);
   const { ContainerClient } = await loadSdk('@azure/storage-blob');
-  return { container: new ContainerClient(`${url.origin}/${encodeURIComponent(name)}?${target.query}`), directory: targetDirectory(target) };
+  const agent = maxFreeSockets && !proxyInEnvironment() ? new (url.protocol === 'http:' ? http : https).Agent({ keepAlive: true, maxFreeSockets }) : undefined;
+  // `agent` is not in the type of StoragePipelineOptions, but the storage pipeline passes it on to @azure/core-rest-pipeline.
+  const container = new ContainerClient(`${url.origin}/${encodeURIComponent(name)}?${target.query}`, undefined, { agent });
+  return { container, directory: targetDirectory(target), destroy: () => agent?.destroy() };
 }
 
 /** The directory of a target SAS URL inside its container ('' for the container itself), decoded. */

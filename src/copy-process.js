@@ -6,6 +6,6 @@ import { createS3 } from './s3.js';
 
 serveCopies(async ({ s3: settings, target, copier }) => {
   const s3 = await createS3({ ...settings, lookupRegion: false });
-  const { container, directory } = await containerFor(target);
+  const { container, directory } = await containerFor(target, { maxFreeSockets: settings.maxSockets });
   return createCopier({ s3, container, directory, ...copier });
 });
