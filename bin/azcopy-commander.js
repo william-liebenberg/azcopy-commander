@@ -51,6 +51,10 @@ so it can be stopped (Ctrl+C) and continued: the listing starts again after the 
   --chunk-minutes <n>         Close a chunk that has objects after n minutes (default 15), so a delta copies early
   --parallel <n>              Chunks copied at once (default 4)
   --concurrency <n>           Uniform chunks: objects copied at once in each chunk (default 32)
+  --copy-processes <n>        Processes that send the copy requests, each with its own S3 and Azure clients, so that
+                              small objects use more than one CPU core (default: one per chunk copied at once, at
+                              most the CPU cores minus one; 0 = in the main process). Not recorded: set it again
+                              when continuing.
   --block-size <size>         Above this size an object is copied in blocks (default 256MiB)
   --max-attempts <n>          Copy attempts per chunk, retries of failed files included (default 5)
   --stop-after inventory      List into chunks and analyse, copy nothing (continue the migration to copy)
@@ -88,6 +92,7 @@ const options = {
   'chunk-minutes': { type: 'string' },
   parallel: { type: 'string' },
   concurrency: { type: 'string' },
+  'copy-processes': { type: 'string' },
   'block-size': { type: 'string' },
   'max-attempts': { type: 'string' },
   'stop-after': { type: 'string' },

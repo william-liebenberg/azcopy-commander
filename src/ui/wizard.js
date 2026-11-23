@@ -41,6 +41,7 @@ const PRESETS = {
   chunkMinutes: { label: 'Chunk minutes', check: (v) => parseCount(String(v).trim(), 'the number of minutes') },
   parallel: { label: 'Chunks at once', check: (v) => parseCount(String(v).trim(), 'the number of chunks') },
   concurrency: { label: 'Objects at once', check: (v) => parseCount(String(v).trim(), 'the number of objects') },
+  copyProcesses: { label: 'Copy processes', check: (v) => parseCount(String(v).trim(), 'the number of processes', 0) },
   blockSize: { label: 'Block size', check: (v) => parseSize(String(v).trim(), 'the block size') },
   maxAttempts: { label: 'Max attempts', check: (v) => parseCount(String(v).trim(), 'the number of attempts') },
   stopAfter: { label: 'Stop after', check: oneOf(['inventory']) },
@@ -277,7 +278,7 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
   async function migrateFlow({ delta = false } = {}) {
     const cli = await commandLine([
       'sourceBucket', 'sourcePrefix', 'sourceRegion', 'overwriteModified', ...(delta ? ['lastCopyDate'] : []), 'sizeProfile', 'chunkFiles', 'chunkBytes', 'chunkMinutes',
-      'parallel', 'concurrency', 'blockSize', 'maxAttempts', 'stopAfter', 'repeat', 'repeatUntil', 'repeatMax',
+      'parallel', 'concurrency', 'copyProcesses', 'blockSize', 'maxAttempts', 'stopAfter', 'repeat', 'repeatUntil', 'repeatMax',
     ]);
     await askAws();
     await askSas();
@@ -368,7 +369,7 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       initialValue: String(MIGRATION_DEFAULTS.concurrency),
       validate: validation((v) => parseCount(v.trim(), 'the number of objects')),
     });
-    const passed = cli.extra(['chunkMinutes', 'blockSize', 'maxAttempts', 'stopAfter']);
+    const passed = cli.extra(['chunkMinutes', 'copyProcesses', 'blockSize', 'maxAttempts', 'stopAfter']);
 
     // A migration that stops after a phase does not run to its end, so no delta can follow it.
     let repeat = false;
@@ -439,8 +440,8 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       return undefined;
     }
     // The ones that can change when continuing (--size-profile: the concurrency of each class).
-    const cli = await commandLine(['parallel', 'concurrency', 'sizeProfile', 'maxAttempts'], { askToUse: false });
-    const changes = cli.extra(['parallel', 'concurrency', 'sizeProfile', 'maxAttempts']);
+    const cli = await commandLine(['parallel', 'concurrency', 'copyProcesses', 'sizeProfile', 'maxAttempts'], { askToUse: false });
+    const changes = cli.extra(['parallel', 'concurrency', 'copyProcesses', 'sizeProfile', 'maxAttempts']);
     await askAws();
     await askSas();
     const target = parseTargetSasUrl(secrets.sas.url);

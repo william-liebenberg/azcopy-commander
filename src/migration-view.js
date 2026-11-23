@@ -167,10 +167,10 @@ export function chunkingLines({ chunks, skipped, archived = 0, maxFiles, maxByte
 }
 
 /** How the copy runs, when it starts (the plain output and the dashboard's log). */
-export function copyStartedLines({ chunks, parallel, concurrency, sizeClasses }) {
+export function copyStartedLines({ chunks, parallel, concurrency, sizeClasses, processes = 0 }) {
   const each = sizeClasses ? 'the objects at once of its size class in each:' : `${concurrency} object(s) at once in each`;
   return [
-    `Copying as the chunks close${chunks > 0 ? ` (${formatCount(chunks)} ready)` : ''}: ${parallel} chunk(s) at a time, ${each}`,
+    `Copying as the chunks close${chunks > 0 ? ` (${formatCount(chunks)} ready)` : ''}${processes > 0 ? `, from ${formatCount(processes)} copy process(es)` : ''}: ${parallel} chunk(s) at a time, ${each}`,
     ...(sizeClasses ? sizeClassLines(sizeClasses) : []).map((l) => `  ${l}`),
   ];
 }
@@ -232,8 +232,9 @@ export function migrationSummaryLines(result, hints = {}) {
  *
  *   start({ dir, logFile, migration })         `migration` is the migration.json record
  *   inventoryStarted({ provider, source, includeAfter, resumeAfter })   inventoryProgress({ files, bytes, chunks })
- *   copyStarted({ chunks, parallel, concurrency, sizeClasses })   `chunks`: the closed chunks left to copy when copying
- *                              starts; `sizeClasses` (a migration chunked by size class) replaces `concurrency`
+ *   copyStarted({ chunks, parallel, concurrency, sizeClasses, processes })   `chunks`: the closed chunks left to copy
+ *                              when copying starts; `sizeClasses` (a migration chunked by size class) replaces
+ *                              `concurrency`; `processes`: the copy processes (0: the main process)
  *   chunking({ chunks, skipped, archived, maxFiles, maxBytes, sizeClasses, chunksDir })   the listing ended (`chunks`: all)
  *   chunkClosed(chunkEntry)   analysis(summary, lines)   chunkStarted(id, chunkEntry)   chunkEnded(chunkEntry)
  *   progress(aggregateSnapshot, { periodic })  failure(id, path, code)

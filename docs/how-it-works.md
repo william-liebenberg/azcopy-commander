@@ -17,7 +17,9 @@ before a multi-day run. For installation and a first migration, see the [README]
 
 The listing and the copy run together in one process. The S3 `ListObjectsV2` listing (1,000 keys per page) writes each
 object into the open chunk of its **size class**. A pool of `--parallel` workers copies the closed chunks in the order
-they close, each with the number of objects at once of its class.
+they close, each with the number of objects at once of its class. The requests of each object are sent from the
+**copy processes** (see [Tuning and limits](#tuning-and-limits)); the main process keeps the listing, `migration.json`,
+the files of each attempt and the dashboard.
 
 ```mermaid
 flowchart LR
@@ -30,7 +32,7 @@ flowchart LR
   XS & S & M & LG & XL -- "class files / --chunk-bytes reached,<br/>or --chunk-minutes old" --> C[Close: 00042.jsonl<br/>pending in migration.json<br/>save the listing positions]
   C --> Q[(Pending chunks)]
   Q --> P[--parallel workers]
-  P --> W[the objects at once of the chunk's class<br/>HEAD S3, presign GET, Put Blob From URL]
+  P --> W[the objects at once of the chunk's class, in the copy processes<br/>HEAD S3, presign GET, Put Blob From URL]
   L -- listing ends --> E[Open chunks closed, analysis,<br/>the workers finish the queue]
 ```
 
@@ -301,6 +303,16 @@ Secrets typed in the wizard stay in memory for the run only; the wizard never of
   `concurrency` of the small classes in a profile (or `--concurrency` for uniform chunks). The defaults are a starting
   point: watch for throttling from S3 or Azure on a real run, and lower them if needed. The throughput of each chunk
   attempt (see [Failures, retries and Ctrl+C](#failures-retries-and-ctrlc)) shows the effect of a change.
+- **CPU**: the requests of one object (S3 HEAD, presigned URL, Put Blob From URL, TLS) cost about 2 ms of CPU, so one
+  process tops out at a few hundred small objects per second. They are sent from `--copy-processes` child processes,
+  each with its own S3 and Azure clients: by default one per chunk copied at once, at most the CPU cores minus one;
+  `--copy-processes 0` sends them from the main process. A copy process gets the SAS over its IPC channel (never on a
+  command line) and the AWS credentials from the environment; it takes a second or two to start (the listing does not
+  wait for it). `--copy-processes` is not recorded: give it again when continuing. In a local benchmark (30,000 small
+  objects, `--parallel 4 --concurrency 64`, a fake S3 and Azure on the same 12-core machine), the main process alone
+  copied 590-670 objects/s on 1 core; 2 copy processes 920-970 objects/s on 2.3 cores, and 4 copy processes about
+  1,550 objects/s on 4.4 cores, with about 300 MiB of memory each. Worker threads were tried first: in one process, 4 of
+  them copied only 860-1,020 objects/s, for 3.6-4 ms of CPU per object.
 - **Start-up**: the first chunk closes after its class's files per chunk or `--chunk-minutes`, so copying starts within
   minutes. The total size and the ETA are known only when the listing ends.
 - **Not copied**: keys with a line break, archived objects that are not restored (restore them, then run a delta), and

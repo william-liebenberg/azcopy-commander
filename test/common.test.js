@@ -74,6 +74,8 @@ test('parseSize and parseCount', () => {
   assert.equal(parseCount('10', '--parallel'), 10);
   assert.equal(parseCount(3, '--parallel'), 3);
   for (const bad of ['0', 'x', '1.5', -2]) assert.throws(() => parseCount(bad, '--parallel'), /--parallel/);
+  assert.equal(parseCount('0', '--copy-processes', 0), 0);
+  assert.throws(() => parseCount('-1', '--copy-processes', 0), /--copy-processes "-1": a whole number of at least 0/);
 });
 
 test('deltaDateFor subtracts the overlap', () => {

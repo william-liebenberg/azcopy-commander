@@ -24,6 +24,7 @@ const OPTIONS = [
   ['chunkMinutes', 'string'],
   ['parallel', 'string'],
   ['concurrency', 'string'],
+  ['copyProcesses', 'string'],
   ['blockSize', 'string'],
   ['maxAttempts', 'string'],
   ['stopAfter', 'string'],

@@ -11,6 +11,7 @@ import { analyseInventory, analysisLines, InventoryAborted, InventoryError, s3Pr
 import { ChunkWriter, chunkId, parseCount, parseSize, readChunkRecords, writeCarriedChunks } from './chunks.js';
 import { concurrencyText, DEFAULT_SIZE_CLASSES, readSizeProfile, sizeClassLines } from './size-classes.js';
 import { containerFor, copyChunk, createCopier, DEFAULT_BLOCK_SIZE, targetDirectory } from './blob-copy.js';
+import { defaultCopyProcesses, startCopyProcesses } from './copy-processes.js';
 import { withS3 } from './s3.js';
 import { writeFileAtomic } from './files.js';
 import { throughputText } from './throughput.js';
@@ -22,8 +23,9 @@ import { ChunkView, deltaLines, formatAggregate, isFinished, MigrationProgress, 
  * The listing and the copy run together. S3 ListObjectsV2 pages are written into chunk files (chunks/00001.jsonl, ...)
  * as they come, each object into the open chunk of its size class (`options.sizeClasses`, see size-classes.js; a
  * uniform migration has one class); each closed chunk goes to a queue that a pool of --parallel chunk workers copies,
- * the concurrency of its class objects at once (see blob-copy.js). When the listing ends, the analysis
- * (inventory-summary.json) is computed from the chunks.
+ * the concurrency of its class objects at once (see blob-copy.js), each object in one of the copy processes (see
+ * copy-processes.js and copyProcessesOf). When the listing ends, the analysis (inventory-summary.json) is computed from
+ * the chunks.
  *
  * migration.json (`format: 2`) is the record: the options, the state of the listing (`inventory`: status, the
  * positions `listedThrough`, `closedThrough` (per class) and `resumeAfter` (see ChunkWriter), counts of closed chunks,
@@ -190,6 +192,18 @@ function parseStopAfter(value) {
   return value;
 }
 
+/**
+ * The copy processes of a run (see copy-processes.js): --copy-processes (0 or more), or one per chunk copied at once,
+ * at most the CPU cores but one. Not recorded: each run counts the cores of its machine. 0 copies in this process, as
+ * do the test hooks that replace the S3 HEAD, the presigned URL or the container, whose fakes live in this process;
+ * --stop-after copies nothing.
+ */
+function copyProcessesOf(opts, options, stopAfter) {
+  const given = opts.copyProcesses === undefined ? undefined : parseCount(opts.copyProcesses, '--copy-processes', 0);
+  if (stopAfter || opts.container || opts.s3?.headObject || opts.s3?.presignGet) return 0;
+  return given ?? defaultCopyProcesses(options.parallel);
+}
+
 /** --repeat, --repeat-until (0 or more), --repeat-max: `{ until, max }`, or null without --repeat. */
 function parseRepeat(opts) {
   if (!opts.repeat) {
@@ -307,7 +321,8 @@ const failedPaths = (runDir) => new Set(failedRecords(runDir).map((r) => r.relat
  *   opts.makeView   ({ delta, round }) => a migration view, called for each round (the wizard's dashboard)
  *   opts.baselineDir  internal: the migration a new delta is based on (see resolveDelta)
  * Test hooks: `opts.abortSignal` (acts like Ctrl+C), `opts.s3` (replaces S3 calls, see src/s3.js), `opts.container` (the
- * target container), `opts.now` (the clock of --chunk-minutes).
+ * target container), `opts.now` (the clock of --chunk-minutes). With fakes of the copy, it runs in this process
+ * (see copyProcessesOf).
  */
 export async function migrateCommand(opts, out = process.stdout) {
   const repeat = parseRepeat(opts);
@@ -445,17 +460,19 @@ async function runOneMigration(opts, out) {
     };
   }
   m.options = options;
+  const processes = copyProcessesOf(opts, options, stopAfter);
   const stateEntry = stateKey(m.sourceBase, m.destBase); // the key of this source and target in state.json
   const summaryFile = path.join(dir, 'inventory-summary.json');
   const chunksDir = path.join(dir, 'chunks');
 
   if (opts.dryRun) {
     for (const w of warnings) out.write(`Warning: ${w}\n`);
-    printDryRun({ out, m, dir, options, continuing, stopAfter });
+    printDryRun({ out, m, dir, options, continuing, stopAfter, processes });
     return { code: EXIT.OK, outcome: 'dry-run', dir, m, options, inventoryFiles: 0 };
   }
   requireAwsCredentials(redactor);
-  const s3 = await withS3(opts, { bucket: m.bucket, region: m.region || undefined, maxSockets: options.parallel * maxConcurrency(options) + 8 }, stopAfter ? ['listPage'] : undefined);
+  const maxSockets = options.parallel * maxConcurrency(options) + 8; // every copy request in flight, in one process or spread over them
+  const s3 = await withS3(opts, { bucket: m.bucket, region: m.region || undefined, maxSockets }, stopAfter ? ['listPage'] : undefined);
   const { container, directory } = stopAfter ? {} : opts.container ? { container: opts.container, directory: targetDirectory(target) } : await containerFor(target);
 
   fs.mkdirSync(dir, { recursive: true });
@@ -475,6 +492,8 @@ async function runOneMigration(opts, out) {
   };
   process.on('SIGINT', onSigint);
 
+  let copierReady = null; // the copy of one object, once the copy processes run
+  let copiers = null;
   const startedMs = Date.now();
   const hints = { continue: `${CLI} migrate --migration "${dir}"` };
   const finish = (outcome) => {
@@ -681,9 +700,18 @@ async function runOneMigration(opts, out) {
       view.analysis?.(summary, lines);
     };
 
+    // ---- the copy of one object: in the copy processes, each with its own clients, or in this one. The processes take
+    // a second or two to load the SDKs: the listing does not wait for them, the chunk workers do.
+    const copierSettings = { prefix: m.prefix, blockSize: options.blockSize, overwriteModified: m.overwriteModified };
+    const data = { s3: { bucket: m.bucket, region: s3.region || m.region || undefined, maxSockets }, target: { base: target.base, query: target.query }, copier: copierSettings };
+    copierReady = stopAfter
+      ? null
+      : processes > 0
+        ? startCopyProcesses({ processes, data, onFatal: fail }).then((c) => (copiers = c).copy)
+        : Promise.resolve(createCopier({ s3, container, directory, ...copierSettings }));
+
     // ---- the copy of one chunk, attempt after attempt
-    const copier = stopAfter ? null : createCopier({ s3, container, directory, prefix: m.prefix, blockSize: options.blockSize, overwriteModified: m.overwriteModified });
-    const runChunk = async (chunk) => {
+    const runChunk = async (chunk, copier) => {
       const began = Date.now();
       view.chunkStarted?.(chunk.id, chunk);
       log('INFO', `chunk ${chunkId(chunk.id)} started (status ${chunk.status}, attempts ${chunk.attempts})`);
@@ -757,11 +785,12 @@ async function runOneMigration(opts, out) {
     };
 
     const worker = async () => {
-      while (!abort.signal.aborted) {
+      const copier = await copierReady.catch(fail);
+      while (copier && !abort.signal.aborted) {
         const chunk = queue.shift();
         if (chunk) {
           try {
-            await runChunk(chunk);
+            await runChunk(chunk, copier);
           } catch (e) {
             fail(e);
           }
@@ -772,8 +801,8 @@ async function runOneMigration(opts, out) {
     };
 
     if (!stopAfter) {
-      view.copyStarted?.({ chunks: queue.length, parallel: options.parallel, concurrency: options.concurrency, sizeClasses: options.sizeClasses });
-      log('INFO', `copying as the chunks close: ${queue.length} ready, ${options.parallel} chunk(s) at a time, ${atOnceText(options)} in each`);
+      view.copyStarted?.({ chunks: queue.length, parallel: options.parallel, concurrency: options.concurrency, sizeClasses: options.sizeClasses, processes });
+      log('INFO', `copying as the chunks close: ${queue.length} ready, ${options.parallel} chunk(s) at a time, ${atOnceText(options)} in each, ${processesText(processes)}`);
     }
     const listed = listingRuns ? listing().catch(fail) : Promise.resolve();
     await Promise.all([listed, ...(stopAfter ? [] : Array.from({ length: options.parallel }, worker))]);
@@ -802,6 +831,8 @@ async function runOneMigration(opts, out) {
     return finish(outcome);
   } finally {
     process.off('SIGINT', onSigint);
+    await copierReady?.catch(() => {}); // processes that start are closed too
+    await copiers?.close();
     view.close?.();
     logStream.end();
     await new Promise((resolve) => logStream.once('close', resolve));
@@ -815,11 +846,14 @@ const classTable = (classes) => sizeClassLines(classes).map((l) => `       ${l}\
 /** The objects copied at once in a chunk, as a text. */
 const atOnceText = (options) => (options.sizeClasses ? `the objects at once of its size class (${concurrencyText(options.sizeClasses)})` : `${options.concurrency} object(s) at once`);
 
-function printDryRun({ out, m, dir, options, continuing, stopAfter }) {
+/** Where the copy requests are sent from, as a text. */
+const processesText = (processes) => (processes > 0 ? `sent from ${formatCount(processes)} copy process(es)` : 'sent from the main process');
+
+function printDryRun({ out, m, dir, options, continuing, stopAfter, processes }) {
   if (continuing) {
     const left = m.chunks.filter((c) => !isFinished(c)).length;
     const listing = m.inventory.status === 'done' ? 'done' : m.inventory.resumeAfter ? 'continued after the last closed chunk' : 'started again';
-    out.write(`\nDry run - would continue migration ${dir}\n  listing ${listing}, ${left} of ${m.chunks.length} chunk(s) to copy, ${options.parallel} at a time, ${atOnceText(options)} in each\n`);
+    out.write(`\nDry run - would continue migration ${dir}\n  listing ${listing}, ${left} of ${m.chunks.length} chunk(s) to copy, ${options.parallel} at a time, ${atOnceText(options)} in each${stopAfter ? '' : `, ${processesText(processes)}`}\n`);
     if (options.sizeClasses) out.write(classTable(options.sizeClasses));
     return;
   }
@@ -836,7 +870,7 @@ function printDryRun({ out, m, dir, options, continuing, stopAfter }) {
       (stopAfter
         ? '  2. Analyse the listing. Stops there: nothing is copied.\n'
         : `  2. Copy each chunk as it closes: ${options.parallel} chunk(s) at once, ${atOnceText(options)} in each, up to ${options.maxAttempts} attempts per chunk\n` +
-          `     (Put Blob From URL from a presigned S3 URL; in blocks above ${formatBytes(options.blockSize)})\n` +
+          `     (Put Blob From URL from a presigned S3 URL; in blocks above ${formatBytes(options.blockSize)}; ${processesText(processes)})\n` +
           '  3. Analyse the listing when it ends\n'),
   );
 }

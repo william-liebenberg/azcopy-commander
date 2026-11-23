@@ -21,10 +21,10 @@ export function parseSize(text, name = 'size') {
   return bytes;
 }
 
-/** A positive whole number from a CLI string or a number. */
-export function parseCount(value, name) {
+/** A whole number of at least `min` (1 by default) from a CLI string or a number. */
+export function parseCount(value, name, min = 1) {
   const n = typeof value === 'number' ? value : /^\d+$/.test(String(value).trim()) ? Number(value) : NaN;
-  if (!Number.isSafeInteger(n) || n < 1) throw new UsageError(`Invalid ${name} "${value}": a whole number of at least 1 is needed.`);
+  if (!Number.isSafeInteger(n) || n < min) throw new UsageError(`Invalid ${name} "${value}": a whole number of at least ${min} is needed.`);
   return n;
 }
 

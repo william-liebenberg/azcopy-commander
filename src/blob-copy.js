@@ -24,7 +24,7 @@ const BLOCKS_AT_ONCE = 8;
 const METADATA_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/; // a C# identifier, as Azure requires
 
 const statusOf = (err) => err?.statusCode ?? err?.$metadata?.httpStatusCode;
-const codeOf = (err) => err?.code ?? err?.details?.errorCode ?? (err?.name && err.name !== 'Error' ? err.name : undefined) ?? (statusOf(err) ? `HTTP${statusOf(err)}` : 'Error');
+export const codeOf = (err) => err?.code ?? err?.details?.errorCode ?? (err?.name && err.name !== 'Error' ? err.name : undefined) ?? (statusOf(err) ? `HTTP${statusOf(err)}` : 'Error');
 /** The blob exists (If-None-Match: *), or is newer than the source (If-Unmodified-Since). */
 const isConditionFailure = (err) => statusOf(err) === 412 || statusOf(err) === 409 || ['ConditionNotMet', 'BlobAlreadyExists'].includes(codeOf(err));
 
