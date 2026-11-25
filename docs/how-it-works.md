@@ -131,6 +131,7 @@ Each object ends as one of:
 | *copied* | Written to the target. |
 | *ignored* | Already at the target (append-only), or not newer with `--overwrite-modified`. |
 | *missing* | The S3 HEAD returned 404: deleted after the listing. Not retried. |
+| *archived* | The S3 HEAD returned an `ArchiveStatus` (`ARCHIVE_ACCESS`, `DEEP_ARCHIVE_ACCESS`): in an archive tier of S3 Intelligent-Tiering, and not restored, so it cannot be read. Not copied, not retried; recorded in the attempt's `archived-<ts>.jsonl`. |
 | *failed* | Any other error, after the SDKs' own retries. Recorded in the attempt's `failed-<ts>.jsonl`. |
 
 One failed object does not fail the others.
@@ -188,7 +189,7 @@ runs/20261113T020000Z-migration/
   chunks/00001.jsonl                   {"path":"a b.txt","size":10,"lastModified":"2024-03-01T10:00:00.000Z","storageClass":"STANDARD"}
   chunks/00043.jsonl.partial           an open chunk (deleted and listed again on continue)
   chunks/skipped.jsonl                 keys that are not copied, with the reason
-  chunks/00001/20261113T020512Z-chunk/ one attempt: run.json, copy-<ts>.log, failed-<ts>.jsonl
+  chunks/00001/20261113T020512Z-chunk/ one attempt: run.json, copy-<ts>.log, failed-<ts>.jsonl, archived-<ts>.jsonl
   migration-<ts>.log                   phases, chunk starts and ends, a progress line every 30 s
 runs/state.json                        the start of the last successful migration per source and target
 ```
@@ -200,6 +201,10 @@ runs/state.json                        the start of the last successful migratio
   may contain tabs.
 - `chunks/skipped.jsonl` lists keys that are not copied: keys with a line break, and archived objects (`GLACIER`,
   `DEEP_ARCHIVE`) that are not restored. Restored objects are copied as usual.
+- The objects in the Archive Access and Deep Archive Access tiers of S3 Intelligent-Tiering are listed as
+  `INTELLIGENT_TIERING`, like readable ones: the copy finds them with its HEAD, and lists them, not restored, in the
+  attempt's `archived-<ts>.jsonl` (the lines of `skipped.jsonl`, reason `archived (ARCHIVE_ACCESS)` or
+  `archived (DEEP_ARCHIVE_ACCESS)`). The migration summary counts them with the other archived objects.
 
 No secret is written anywhere: the SAS URL, the AWS keys and the presigned URLs stay in memory, and the SAS signature
 and AWS secrets are redacted from logs and console output.

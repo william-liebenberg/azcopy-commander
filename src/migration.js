@@ -30,7 +30,7 @@ import { ChunkView, deltaLines, formatAggregate, isFinished, MigrationProgress, 
  * migration.json (`format: 2`) is the record: the options, the state of the listing (`inventory`: status, the
  * positions `listedThrough`, `closedThrough` (per class) and `resumeAfter` (see ChunkWriter), counts of closed chunks,
  * the size of skipped.jsonl) and one entry per chunk
- * ({ id, list, files, bytes, sizeClass?, status, attempts, runs, copied, ignored, missing, failed, bytesCopied, throughput?, carried? }).
+ * ({ id, list, files, bytes, sizeClass?, status, attempts, runs, copied, ignored, missing, archived, failed, bytesCopied, throughput?, carried? }).
  * `throughput` is the last attempt's (see throughput.js), left out when it copied nothing.
  * A migration continued lists again from `resumeAfter` (S3 lists keys in order), after deleting the open chunks, and
  * leaves out what was already recorded. An `inventory` with `resumeAfter` alone (before size classes) reads as
@@ -400,7 +400,7 @@ export function repeatSummaryLines({ rounds, repeat, ending }) {
 }
 
 /** A chunk entry of migration.json for a chunk just written. */
-const newEntry = (chunk) => ({ ...chunk, status: 'pending', attempts: 0, runs: [], copied: 0, ignored: 0, missing: 0, failed: 0, bytesCopied: 0 });
+const newEntry = (chunk) => ({ ...chunk, status: 'pending', attempts: 0, runs: [], copied: 0, ignored: 0, missing: 0, archived: 0, failed: 0, bytesCopied: 0 });
 
 /**
  * One migration, started or continued: returns `{ code, outcome, dir, m, options, inventoryFiles }` (`m` is the
@@ -503,6 +503,7 @@ async function runOneMigration(opts, out) {
     save();
     const chunks = m.chunks;
     const sum = (field) => chunks.reduce((s, c) => s + (Number(c[field]) || 0), 0);
+    const archivedAtCopy = sum('archived'); // in an archive tier of S3 Intelligent-Tiering: found by the copy's HEAD
     const result = {
       outcome,
       dir,
@@ -517,15 +518,16 @@ async function runOneMigration(opts, out) {
       failed: sum('failed'),
       bytesCopied: sum('bytesCopied'),
       elapsedSeconds: Math.round((Date.now() - startedMs) / 1000),
-      skipped: m.inventory.skipped ?? 0,
-      archived: m.inventory.archived ?? 0,
+      skipped: (m.inventory.skipped ?? 0) + archivedAtCopy,
+      archived: (m.inventory.archived ?? 0) + archivedAtCopy,
+      archivedAtCopy,
       skippedFile: path.join(chunksDir, 'skipped.jsonl'),
       includeAfter: m.includeAfter ?? null,
       baseline: m.baseline ?? null,
       carried: m.carried ?? null,
       files: { log: logFile, migration: migrationFile(dir) },
     };
-    log('INFO', `migration ${outcome}: ${result.chunksSuccess}/${result.chunksTotal} chunk(s) copied, ${result.chunksExhausted} exhausted, ${result.chunksOpen} open; copied ${result.copied}, ignored ${result.ignored}, missing ${result.missing}, failed ${result.failed}`);
+    log('INFO', `migration ${outcome}: ${result.chunksSuccess}/${result.chunksTotal} chunk(s) copied, ${result.chunksExhausted} exhausted, ${result.chunksOpen} open; copied ${result.copied}, ignored ${result.ignored}, missing ${result.missing}, archived ${result.archived}, failed ${result.failed}`);
     view.summary(result, hints);
     return { code: EXIT_BY_OUTCOME[outcome], outcome, dir, m, options, inventoryFiles: m.inventory.files ?? 0 };
   };
@@ -760,13 +762,14 @@ async function runOneMigration(opts, out) {
         if (outcome !== 'interrupted') {
           chunk.ignored += report.ignored;
           chunk.missing = (chunk.missing ?? 0) + report.missing;
+          chunk.archived = (chunk.archived ?? 0) + report.archived;
           chunk.failed = report.failed;
         }
         chunk.status = outcome;
         if (report.throughput) chunk.throughput = report.throughput;
         else delete chunk.throughput;
         const throughput = report.throughput ? `; throughput ${throughputText(report.throughput)}` : '';
-        log('INFO', `chunk ${chunkId(chunk.id)} attempt ${chunk.attempts}: ${outcome} (copied ${report.copied}, ignored ${report.ignored}, missing ${report.missing}, failed ${report.failed})${throughput}`);
+        log('INFO', `chunk ${chunkId(chunk.id)} attempt ${chunk.attempts}: ${outcome} (copied ${report.copied}, ignored ${report.ignored}, missing ${report.missing}, ${report.archived > 0 ? `archived ${report.archived}, ` : ''}failed ${report.failed})${throughput}`);
         if (outcome === 'success') {
           chunk.failed = 0;
           break;

@@ -49,7 +49,9 @@ function counter() {
 const encodeKey = (key) => key.split('/').map(encodeURIComponent).join('/');
 
 /**
- * A fake S3 bucket. `objects` maps a key to { size, lastModified, storageClass, restore, metadata, contentType }.
+ * A fake S3 bucket. `objects` maps a key to { size, lastModified, storageClass, restore, metadata, contentType,
+ * archiveStatus, headRestore } (`restore`: the RestoreStatus of the listing; `archiveStatus` and `headRestore`: the
+ * ArchiveStatus and Restore of the HEAD; a source with `archiveStatus` and no `headRestore` cannot be read by Azure).
  *   s3.pages             the ListObjectsV2 params of each page asked for
  *   s3.heads             the keys HEAD was asked for
  *   s3.beforePage(n, params)   awaited before page n (0-based) is answered: a test holds the listing with it
@@ -109,6 +111,8 @@ export function fakeS3(objects = {}, { pageSize, region = 'ap-southeast-2' } = {
           LastModified: new Date(o.lastModified),
           ContentType: o.contentType ?? 'application/octet-stream',
           Metadata: o.metadata ?? {},
+          ...(o.archiveStatus ? { ArchiveStatus: o.archiveStatus } : {}),
+          ...(o.headRestore ? { Restore: o.headRestore } : {}),
         };
       });
     },
@@ -139,6 +143,7 @@ export function fakeContainer(s3) {
     const key = decodeURIComponent(u.pathname.slice(1));
     const o = s3.store.get(key);
     if (!o) throw httpError(404, 'CannotVerifyCopySource');
+    if (o.archiveStatus && !o.headRestore) throw httpError(403, 'CannotVerifyCopySource'); // S3: 403 InvalidObjectState
     return { key, o };
   };
   const check = (name, conditions = {}) => {

@@ -24,7 +24,7 @@ function doneBytes(c, live) {
  * (`listing` set, with the objects listed so far) the total grows: it is shown with a `+`, and there is no ETA.
  *
  * `chunks` are the entries of migration.json, the array the orchestrator adds the closed chunks to (status, bytes of
- * the chunk, and `copied` / `ignored` / `missing` / `failed` / `bytesCopied` summed over the attempts that ended).
+ * the chunk, and `copied` / `ignored` / `missing` / `archived` / `failed` / `bytesCopied` summed over the attempts that ended).
  * The running chunks report through `update(id, snapshot)` (see copyChunk) and are folded in on top.
  *
  * The snapshot also has `running` (the numbers of the attempt of each running chunk), `classes` (the totals of each
@@ -77,7 +77,7 @@ export class MigrationProgress {
           id: c.id,
           ...(c.sizeClass ? { sizeClass: c.sizeClass } : {}),
           percent: fraction * 100,
-          filesDone: num(live.copied) + num(live.ignored) + num(live.missing) + num(live.failed),
+          filesDone: num(live.copied) + num(live.ignored) + num(live.missing) + num(live.archived) + num(live.failed),
           filesTotal: num(live.filesTotal),
           bytesDone: num(live.bytesDone),
           bytesTotal: num(live.bytesTotal),
@@ -177,7 +177,7 @@ export function copyStartedLines({ chunks, parallel, concurrency, sizeClasses, p
 
 /** The line that says how a chunk ended, with its last attempt's throughput unless `throughput` is false. */
 export function chunkEndLine(c, { throughput = true } = {}) {
-  return `${chunkLabel(c)} ${c.status}   copied ${formatCount(c.copied)}  ignored ${formatCount(c.ignored)}  ${num(c.missing) > 0 ? `missing ${formatCount(c.missing)}  ` : ''}failed ${formatCount(c.failed)}   ${formatBytes(c.bytesCopied)}  ${formatDuration(c.seconds ?? 0)}${throughput && c.throughput ? `   ${throughputText(c.throughput)}` : ''}`;
+  return `${chunkLabel(c)} ${c.status}   copied ${formatCount(c.copied)}  ignored ${formatCount(c.ignored)}  ${num(c.missing) > 0 ? `missing ${formatCount(c.missing)}  ` : ''}${num(c.archived) > 0 ? `archived ${formatCount(c.archived)}  ` : ''}failed ${formatCount(c.failed)}   ${formatBytes(c.bytesCopied)}  ${formatDuration(c.seconds ?? 0)}${throughput && c.throughput ? `   ${throughputText(c.throughput)}` : ''}`;
 }
 
 const TITLES = { success: 'Migration completed', partial: 'Migration completed with failed files', failed: 'Migration failed', interrupted: 'Migration interrupted', stopped: 'Migration stopped' };
@@ -199,6 +199,15 @@ export function deltaLines(m) {
   return lines;
 }
 
+/**
+ * Where the keys not copied are listed: skipped.jsonl (by the listing), and the archived-*.jsonl of the chunk folders
+ * (`archivedAtCopy`: the objects in an archive tier of S3 Intelligent-Tiering, found by the copy).
+ */
+export function skippedWhere(result) {
+  const atCopy = num(result.archivedAtCopy);
+  return [result.skipped > atCopy ? result.skippedFile : '', atCopy > 0 ? 'the archived-*.jsonl in the chunk folders' : ''].filter(Boolean).join(' and ');
+}
+
 /** The final summary of a migration (console and migration log). `result` is built by migrateCommand. */
 export function migrationSummaryLines(result, hints = {}) {
   const lines = [
@@ -218,7 +227,7 @@ export function migrationSummaryLines(result, hints = {}) {
   if (result.skipped > 0) {
     const archived = num(result.archived);
     const kinds = [archived > 0 ? `${formatCount(archived)} archived (not restored)` : '', result.skipped > archived ? `${formatCount(result.skipped - archived)} with a line break` : ''].filter(Boolean).join(', ');
-    lines.push(`Not copied:       ${formatCount(result.skipped)} key(s) (${kinds}), listed in ${result.skippedFile}`);
+    lines.push(`Not copied:       ${formatCount(result.skipped)} key(s) (${kinds}), listed in ${skippedWhere(result)}`);
   }
   if (result.failed > 0 || result.chunksExhausted > 0) lines.push('Failed files:     see the failed-*.jsonl in the chunk folders; `migrate --migration` tries them again');
   if (result.outcome === 'interrupted' || result.outcome === 'stopped' || result.chunksOpen > 0) lines.push(`Continue:         ${hints.continue}`);

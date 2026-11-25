@@ -12,10 +12,11 @@ import { ThroughputMeter, throughputText } from './throughput.js';
  *   createCopier the copy of one object: S3 HEAD (size, last modified, content headers, metadata), then Put Blob From URL, or
  *                Put Block From URL per range and Put Block List above the block size
  *   copyChunk    a chunk's records, `concurrency` at a time, with the files of one attempt (run.json, copy-<ts>.log,
- *                failed-<ts>.jsonl)
+ *                failed-<ts>.jsonl, archived-<ts>.jsonl)
  *
  * An object ends as `copied`, `ignored` (the blob exists: append-only, or newer with --overwrite-modified), `missing`
- * (S3 HEAD 404: deleted after the listing) or failed (an error with a `code`, recorded in the failed list).
+ * (S3 HEAD 404: deleted after the listing), `archived` (in an archive tier of S3 Intelligent-Tiering and not restored,
+ * see archiveTierOf) or failed (an error with a `code`, recorded in the failed list).
  */
 
 const MiB = 2 ** 20;
@@ -53,6 +54,22 @@ export function validMetadata(metadata = {}) {
   return { metadata: valid, invalid };
 }
 
+/**
+ * The archive tier of an S3 Intelligent-Tiering object (HEAD `ArchiveStatus`: ARCHIVE_ACCESS or DEEP_ARCHIVE_ACCESS)
+ * that is not restored, or null. Such an object is listed with the storage class INTELLIGENT_TIERING, so the listing
+ * cannot tell it from a readable one; its GET fails (403 InvalidObjectState) until it is restored, and so would the copy.
+ * A restored object has `Restore: ongoing-request="false"`, with an `expiry-date` when its copy is temporary.
+ */
+export function archiveTierOf(head, now = new Date()) {
+  if (!head.ArchiveStatus) return null;
+  const restore = String(head.Restore ?? '');
+  if (/ongoing-request="false"/.test(restore)) {
+    const expiry = new Date(/expiry-date="([^"]+)"/.exec(restore)?.[1] ?? NaN);
+    if (Number.isNaN(expiry.getTime()) || expiry > now) return null;
+  }
+  return head.ArchiveStatus;
+}
+
 /** Block ids of equal length, as a block blob requires. */
 export const blockId = (i) => Buffer.from(String(i).padStart(6, '0')).toString('base64');
 
@@ -86,7 +103,8 @@ export const targetDirectory = (target) => new URL(target.base).pathname.split('
 
 /**
  * The function that copies one object: `copy(record, { signal })` resolves to `{ result, bytes, invalidMetadata }`
- * or rejects with the error of S3 or Azure.
+ * (`{ result: 'archived', bytes: 0, archiveStatus }` for an object in an archive tier, not copied) or rejects with the
+ * error of S3 or Azure.
  *   s3          see src/s3.js (headObject, presignGet)
  *   container   a ContainerClient (or a fake with getBlockBlobClient)
  *   prefix      the source prefix: the S3 key is `<prefix>/<path>`; the blob name is `<directory>/<prefix>/<path>`
@@ -99,6 +117,8 @@ export function createCopier({ s3, container, directory = '', prefix = '', block
     const key = keyOf(record.path);
     const head = await s3.headObject(key, { signal });
     if (!head) return { result: 'missing', bytes: 0 };
+    const archiveStatus = archiveTierOf(head);
+    if (archiveStatus) return { result: 'archived', bytes: 0, archiveStatus };
     const size = Number(head.ContentLength) || 0;
     const blob = container.getBlockBlobClient(blobName(record.path));
     const { metadata, invalid } = validMetadata(head.Metadata);
@@ -161,12 +181,14 @@ export function createCopier({ s3, container, directory = '', prefix = '', block
 /**
  * Copies a chunk's records, `concurrency` at a time, and writes the attempt's files in `runDir`:
  *   run.json            `manifest` with the attempt's counters and outcome
- *   copy-<ts>.log       failed and missing objects, invalid metadata names, the summary
+ *   copy-<ts>.log       failed, missing and archived objects, invalid metadata names, the summary
  *   failed-<ts>.jsonl   { relativePath, src, dst, errorCode, size } per failed object (no query string: no secret)
- * `onProgress({ copied, ignored, missing, failed, bytesDone, bytesTotal, filesTotal })` is called as objects end (at most every
+ *   archived-<ts>.jsonl { path, size, reason, storageClass?, lastModified? } per object in an archive tier (the lines
+ *                       of chunks/skipped.jsonl, reason `archived (<ArchiveStatus>)`)
+ * `onProgress({ copied, ignored, missing, archived, failed, bytesDone, bytesTotal, filesTotal })` is called as objects end (at most every
  * `intervalMs`) and at the end; `onFailure(path, errorCode)` for each failed object. `redact` cleans an error message before it is written.
  * The attempt's throughput (see throughput.js, timed with `now`) is in run.json, the log and the report.
- * Returns { outcome, copied, ignored, missing, failed, bytesCopied, throughput, files: { log, failed } }; outcome is success,
+ * Returns { outcome, copied, ignored, missing, archived, failed, bytesCopied, throughput, files: { log, failed, archived } }; outcome is success,
  * partial (some objects failed) or interrupted (`signal` aborted before every object ended); throughput is null when
  * nothing was copied.
  */
@@ -175,6 +197,7 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
   const stamp = fileTimestamp();
   const logFile = path.join(runDir, `copy-${stamp}.log`);
   const failedFile = path.join(runDir, `failed-${stamp}.jsonl`);
+  const archivedFile = path.join(runDir, `archived-${stamp}.jsonl`);
   const writeManifest = (m) => fs.writeFileSync(path.join(runDir, 'run.json'), `${JSON.stringify(m, null, 2)}\n`);
   const logLines = [];
   const log = (level, msg) => logLines.push(`${new Date().toISOString()} ${level.padEnd(5)} ${redact(msg)}`);
@@ -183,8 +206,9 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
   };
   const encoded = (p) => p.split('/').map(encodeURIComponent).join('/');
   const failedLines = [];
+  const archivedLines = [];
 
-  const counts = { copied: 0, ignored: 0, missing: 0, failed: 0, bytesDone: 0, bytesTotal: records.reduce((s, r) => s + (Number(r.size) || 0), 0), filesTotal: records.length };
+  const counts = { copied: 0, ignored: 0, missing: 0, archived: 0, failed: 0, bytesDone: 0, bytesTotal: records.reduce((s, r) => s + (Number(r.size) || 0), 0), filesTotal: records.length };
   let bytesCopied = 0;
   const invalidNames = new Set();
   let lastReport = 0;
@@ -208,7 +232,7 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
       const size = Number(record.size) || 0;
       try {
         const began = now();
-        const { result, bytes, invalidMetadata = [] } = await copy(record, { signal });
+        const { result, bytes, invalidMetadata = [], archiveStatus } = await copy(record, { signal });
         invalidMetadata.forEach((n) => invalidNames.add(n));
         counts[result]++;
         if (result === 'copied') {
@@ -216,6 +240,10 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
           meter.object(bytes, began, now());
         }
         if (result === 'missing') log('WARN', `missing at the source (deleted after the listing): ${record.path}`);
+        if (result === 'archived') {
+          log('WARN', `archived (${archiveStatus}, not restored): ${record.path}`);
+          archivedLines.push(JSON.stringify({ path: record.path, size, reason: `archived (${archiveStatus})`, ...(record.storageClass ? { storageClass: record.storageClass } : {}), ...(record.lastModified ? { lastModified: record.lastModified } : {}) }));
+        }
         counts.bytesDone += size;
         ended++;
       } catch (err) {
@@ -236,13 +264,14 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
     await Promise.all(Array.from({ length: Math.min(concurrency, records.length) }, worker));
   } finally {
     if (failedLines.length > 0) fs.writeFileSync(failedFile, `${failedLines.join('\n')}\n`);
+    if (archivedLines.length > 0) fs.writeFileSync(archivedFile, `${archivedLines.join('\n')}\n`);
     if (invalidNames.size > 0) log('WARN', `metadata left out (not a valid Azure metadata name): ${[...invalidNames].sort().join(', ')}`);
     const outcome = ended < records.length ? 'interrupted' : counts.failed > 0 ? 'partial' : 'success';
-    log('INFO', `${outcome}: copied ${counts.copied}, ignored ${counts.ignored} (already at the target), missing ${counts.missing}, failed ${counts.failed}`);
+    log('INFO', `${outcome}: copied ${counts.copied}, ignored ${counts.ignored} (already at the target), missing ${counts.missing}, ${counts.archived > 0 ? `archived ${counts.archived} (not restored), ` : ''}failed ${counts.failed}`);
     throughput = meter.finish(now());
     if (throughput) log('INFO', `throughput ${throughputText(throughput)}`);
     flushLog();
-    writeManifest({ ...manifest, startedAt, finishedAt: new Date().toISOString(), files: records.length, outcome, copied: counts.copied, ignored: counts.ignored, missing: counts.missing, failed: counts.failed, bytesCopied, throughput });
+    writeManifest({ ...manifest, startedAt, finishedAt: new Date().toISOString(), files: records.length, outcome, copied: counts.copied, ignored: counts.ignored, missing: counts.missing, archived: counts.archived, failed: counts.failed, bytesCopied, throughput });
     report(true);
   }
   const outcome = ended < records.length ? 'interrupted' : counts.failed > 0 ? 'partial' : 'success';
@@ -251,9 +280,10 @@ export async function copyChunk({ records, concurrency, signal, copy, runDir, ma
     copied: counts.copied,
     ignored: counts.ignored,
     missing: counts.missing,
+    archived: counts.archived,
     failed: counts.failed,
     bytesCopied,
     throughput,
-    files: { log: logFile, failed: failedLines.length > 0 ? failedFile : null },
+    files: { log: logFile, failed: failedLines.length > 0 ? failedFile : null, archived: archivedLines.length > 0 ? archivedFile : null },
   };
 }

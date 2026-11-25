@@ -1,5 +1,5 @@
 import { formatBytes, formatCount } from '../format.js';
-import { chunkEndLine, chunkingLines, chunkLabel, copyStartedLines, migrationTitle } from '../migration-view.js';
+import { chunkEndLine, chunkingLines, chunkLabel, copyStartedLines, migrationTitle, skippedWhere } from '../migration-view.js';
 import { throughputText } from '../throughput.js';
 import { chunkId } from '../chunks.js';
 import { createStyle, symbolsFor, visible } from './style.js';
@@ -51,7 +51,7 @@ function renderResult(state, { columns, st, sym }) {
   if (result.skipped > 0) {
     const archived = Number(result.archived) || 0;
     const kinds = [archived > 0 ? `${formatCount(archived)} archived` : '', result.skipped > archived ? `${formatCount(result.skipped - archived)} with a line break` : ''].filter(Boolean).join(', ');
-    lines.push(labelled('not copied', `${formatCount(result.skipped)} key(s) (${kinds}), see ${result.skippedFile}`, st.yellow));
+    lines.push(labelled('not copied', `${formatCount(result.skipped)} key(s) (${kinds}), see ${skippedWhere(result)}`, st.yellow));
   }
   const codes = state.errorCodes ?? [];
   if (codes.length > 0) {

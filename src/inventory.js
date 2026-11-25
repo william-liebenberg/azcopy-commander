@@ -20,7 +20,11 @@ export class InventoryError extends Error {}
 /** The listing was stopped (Ctrl+C): not a failure. */
 export class InventoryAborted extends Error {}
 
-/** Archive classes: an object in one of them cannot be read (or copied) until it is restored. */
+/**
+ * Archive classes: an object in one of them cannot be read (or copied) until it is restored. The archive tiers of S3
+ * Intelligent-Tiering are not among them: their objects are listed as INTELLIGENT_TIERING, and only a HEAD tells
+ * them apart, so the copy skips them (see archiveTierOf in blob-copy.js).
+ */
 export const ARCHIVE_CLASSES = new Set(['GLACIER', 'DEEP_ARCHIVE']);
 
 /** True when an object of an archive class has a restored copy that can be read now. */
