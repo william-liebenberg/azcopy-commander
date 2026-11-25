@@ -4,6 +4,7 @@ import https from 'node:https';
 import path from 'node:path';
 import { loadSdk } from './sdk.js';
 import { fileTimestamp } from './format.js';
+import { ARCHIVE_CLASSES } from './inventory.js';
 import { ThroughputMeter, throughputText } from './throughput.js';
 
 /*
@@ -15,8 +16,8 @@ import { ThroughputMeter, throughputText } from './throughput.js';
  *                failed-<ts>.jsonl, archived-<ts>.jsonl)
  *
  * An object ends as `copied`, `ignored` (the blob exists: append-only, or newer with --overwrite-modified), `missing`
- * (S3 HEAD 404: deleted after the listing), `archived` (in an archive tier of S3 Intelligent-Tiering and not restored,
- * see archiveTierOf) or failed (an error with a `code`, recorded in the failed list).
+ * (S3 HEAD 404: deleted after the listing), `archived` (in an archive class or tier and not restored, see archiveStatusOf)
+ * or failed (an error with a `code`, recorded in the failed list).
  */
 
 const MiB = 2 ** 20;
@@ -55,19 +56,22 @@ export function validMetadata(metadata = {}) {
 }
 
 /**
- * The archive tier of an S3 Intelligent-Tiering object (HEAD `ArchiveStatus`: ARCHIVE_ACCESS or DEEP_ARCHIVE_ACCESS)
- * that is not restored, or null. Such an object is listed with the storage class INTELLIGENT_TIERING, so the listing
- * cannot tell it from a readable one; its GET fails (403 InvalidObjectState) until it is restored, and so would the copy.
+ * Where an object that is not restored is archived, or null when it can be read: the archive tier of an S3
+ * Intelligent-Tiering object (HEAD `ArchiveStatus`: ARCHIVE_ACCESS or DEEP_ARCHIVE_ACCESS), or its archive class
+ * (HEAD `StorageClass`: GLACIER or DEEP_ARCHIVE). The listing cannot tell the first from a readable object (it is
+ * listed as INTELLIGENT_TIERING); the second is skipped by the listing, but the carried files of a delta are copied
+ * without one. Its GET fails (403 InvalidObjectState) until it is restored, and so would the copy.
  * A restored object has `Restore: ongoing-request="false"`, with an `expiry-date` when its copy is temporary.
  */
-export function archiveTierOf(head, now = new Date()) {
-  if (!head.ArchiveStatus) return null;
+export function archiveStatusOf(head, now = new Date()) {
+  const status = head.ArchiveStatus ?? (ARCHIVE_CLASSES.has(head.StorageClass) ? head.StorageClass : null);
+  if (!status) return null;
   const restore = String(head.Restore ?? '');
   if (/ongoing-request="false"/.test(restore)) {
     const expiry = new Date(/expiry-date="([^"]+)"/.exec(restore)?.[1] ?? NaN);
     if (Number.isNaN(expiry.getTime()) || expiry > now) return null;
   }
-  return head.ArchiveStatus;
+  return status;
 }
 
 /** Block ids of equal length, as a block blob requires. */
@@ -117,7 +121,7 @@ export function createCopier({ s3, container, directory = '', prefix = '', block
     const key = keyOf(record.path);
     const head = await s3.headObject(key, { signal });
     if (!head) return { result: 'missing', bytes: 0 };
-    const archiveStatus = archiveTierOf(head);
+    const archiveStatus = archiveStatusOf(head);
     if (archiveStatus) return { result: 'archived', bytes: 0, archiveStatus };
     const size = Number(head.ContentLength) || 0;
     const blob = container.getBlockBlobClient(blobName(record.path));
@@ -183,8 +187,8 @@ export function createCopier({ s3, container, directory = '', prefix = '', block
  *   run.json            `manifest` with the attempt's counters and outcome
  *   copy-<ts>.log       failed, missing and archived objects, invalid metadata names, the summary
  *   failed-<ts>.jsonl   { relativePath, src, dst, errorCode, size } per failed object (no query string: no secret)
- *   archived-<ts>.jsonl { path, size, reason, storageClass?, lastModified? } per object in an archive tier (the lines
- *                       of chunks/skipped.jsonl, reason `archived (<ArchiveStatus>)`)
+ *   archived-<ts>.jsonl { path, size, reason, storageClass?, lastModified? } per archived object (the lines of
+ *                       chunks/skipped.jsonl, reason `archived (<ArchiveStatus or StorageClass>)`)
  * `onProgress({ copied, ignored, missing, archived, failed, bytesDone, bytesTotal, filesTotal })` is called as objects end (at most every
  * `intervalMs`) and at the end; `onFailure(path, errorCode)` for each failed object. `redact` cleans an error message before it is written.
  * The attempt's throughput (see throughput.js, timed with `now`) is in run.json, the log and the report.

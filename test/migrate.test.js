@@ -11,7 +11,7 @@ import { UsageError } from '../src/errors.js';
 import { analyseInventory, analysisLines, s3Provider } from '../src/inventory.js';
 import { MigrationProgress, formatAggregate } from '../src/migration-view.js';
 import { collectCarried, listMigrations, migrateCommand, readMigration } from '../src/migration.js';
-import { archiveTierOf, copyChunk, createCopier } from '../src/blob-copy.js';
+import { archiveStatusOf, copyChunk, createCopier } from '../src/blob-copy.js';
 import { ThroughputMeter, throughputText } from '../src/throughput.js';
 import { readState, saveState, stateKey } from '../src/state.js';
 import { fakeContainer, fakeS3, httpError, PRESIGN_SECRET } from './fakes.js';
@@ -475,27 +475,33 @@ test('copier: above the block size, staged blocks with ids of equal length, then
   assert.deepEqual(container.requests.map((r) => r.request), ['properties']);
 });
 
-test('copier: an object in an archive tier of S3 Intelligent-Tiering is archived, not copied, until it is restored', async () => {
+test('copier: an object in an archive tier of S3 Intelligent-Tiering or an archive class is archived, not copied, until it is restored', async () => {
   const IT = 'INTELLIGENT_TIERING';
   const { container, copy } = copier({
     'data/cold.bin': { size: 10, storageClass: IT, archiveStatus: 'ARCHIVE_ACCESS' },
     'data/colder.bin': { size: 20, storageClass: IT, archiveStatus: 'DEEP_ARCHIVE_ACCESS', headRestore: 'ongoing-request="true"' },
     'data/back.bin': { size: 30, storageClass: IT, archiveStatus: 'ARCHIVE_ACCESS', headRestore: 'ongoing-request="false", expiry-date="Fri, 21 Dec 2099 00:00:00 GMT"' },
     'data/warm.bin': { size: 40, storageClass: IT },
+    'data/glacier.bin': { size: 50, storageClass: 'GLACIER' },
+    'data/thawed.bin': { size: 60, storageClass: 'DEEP_ARCHIVE', restore: { IsRestoreInProgress: false } },
   });
   assert.deepEqual(await copy({ path: 'cold.bin' }), { result: 'archived', bytes: 0, archiveStatus: 'ARCHIVE_ACCESS' });
   assert.deepEqual(await copy({ path: 'colder.bin' }), { result: 'archived', bytes: 0, archiveStatus: 'DEEP_ARCHIVE_ACCESS' }, 'a restore in progress');
+  assert.deepEqual(await copy({ path: 'glacier.bin' }), { result: 'archived', bytes: 0, archiveStatus: 'GLACIER' }, 'an archive class (a carried file)');
   assert.deepEqual(container.requests, [], 'nothing is sent to Azure for them');
+  assert.equal((await copy({ path: 'thawed.bin' })).result, 'copied', 'an archive class, restored');
   assert.equal((await copy({ path: 'back.bin' })).result, 'copied', 'restored');
   assert.equal((await copy({ path: 'warm.bin' })).result, 'copied', 'in an access tier');
 
   const now = new Date('2026-06-01T00:00:00Z');
   const head = (Restore) => ({ ArchiveStatus: 'ARCHIVE_ACCESS', ...(Restore ? { Restore } : {}) });
-  assert.equal(archiveTierOf({}, now), null);
-  assert.equal(archiveTierOf(head(), now), 'ARCHIVE_ACCESS');
-  assert.equal(archiveTierOf(head('ongoing-request="false"'), now), null, 'restored, without an expiry');
-  assert.equal(archiveTierOf(head('ongoing-request="false", expiry-date="Mon, 01 Jun 2026 01:00:00 GMT"'), now), null);
-  assert.equal(archiveTierOf(head('ongoing-request="false", expiry-date="Sun, 31 May 2026 23:00:00 GMT"'), now), 'ARCHIVE_ACCESS', 'the restored copy expired');
+  assert.equal(archiveStatusOf({}, now), null);
+  assert.equal(archiveStatusOf({ StorageClass: 'GLACIER_IR' }, now), null);
+  assert.equal(archiveStatusOf(head(), now), 'ARCHIVE_ACCESS');
+  assert.equal(archiveStatusOf({ StorageClass: 'DEEP_ARCHIVE', Restore: 'ongoing-request="true"' }, now), 'DEEP_ARCHIVE');
+  assert.equal(archiveStatusOf(head('ongoing-request="false"'), now), null, 'restored, without an expiry');
+  assert.equal(archiveStatusOf(head('ongoing-request="false", expiry-date="Mon, 01 Jun 2026 01:00:00 GMT"'), now), null);
+  assert.equal(archiveStatusOf(head('ongoing-request="false", expiry-date="Sun, 31 May 2026 23:00:00 GMT"'), now), 'ARCHIVE_ACCESS', 'the restored copy expired');
 });
 
 test('copier: a presigned URL longer than 2 KiB is sent to Azure', async () => {
@@ -669,6 +675,33 @@ test('migrate: objects in an archive tier of S3 Intelligent-Tiering are reported
   const text = out.text();
   assert.match(text, /archived 1 {2}failed 0/, 'on the chunk end line');
   assert.match(text, /Not copied: {7}2 key\(s\) \(2 archived \(not restored\)\), listed in .*skipped\.jsonl and the archived-\*\.jsonl in the chunk folders/);
+});
+
+test('migrate: a delta carries the archived objects of its baseline; restored ones are copied, the others carried on', async () => {
+  const { base, s3, container, migrationDirs } = setup({
+    'data/a.txt': { size: 10, lastModified: OLD },
+    'data/cold.bin': { size: 40, lastModified: OLD, storageClass: 'GLACIER' },
+    'data/it-cold.bin': { size: 50, lastModified: OLD, storageClass: 'INTELLIGENT_TIERING', archiveStatus: 'ARCHIVE_ACCESS' },
+  });
+  assert.equal(await migrateCommand(base, sink()), 0);
+  assert.deepEqual([...container.blobs.keys()], ['data/a.txt']);
+
+  // cold.bin is restored (its last-modified time does not change); it-cold.bin is not
+  s3.store.get('data/cold.bin').restore = { IsRestoreInProgress: false };
+  const out = sink();
+  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto' }, out), 0, out.text());
+  let d = readMigration(migrationDirs()[1]);
+  assert.deepEqual([d.inventory.files, d.carried.files, d.carried.archived, d.carried.fromChunks], [0, 2, 2, []]);
+  assert.deepEqual(readChunkRecords(path.join(migrationDirs()[1], d.chunks[0].list)).map((r) => r.path).sort(), ['cold.bin', 'it-cold.bin']);
+  assert.deepEqual([...container.blobs.keys()].sort(), ['data/a.txt', 'data/cold.bin']);
+  assert.deepEqual([d.outcome, d.chunks[0].archived, d.chunks[0].failed], ['success', 1, 0]);
+  assert.match(out.text(), /Carried: {10}2 file\(s\) that .* did not copy \(2 archived\), 90 B/);
+
+  // the next delta carries it-cold.bin again: the copy found it still archived
+  assert.equal(await migrateCommand({ ...base, lastCopyDate: 'auto' }, sink()), 0);
+  d = readMigration(migrationDirs()[2]);
+  assert.deepEqual([d.carried.files, d.carried.archived], [1, 1]);
+  assert.deepEqual(readChunkRecords(path.join(migrationDirs()[2], d.chunks[0].list)).map((r) => r.path), ['it-cold.bin']);
 });
 
 test('migrate: copying starts while the listing runs (page 3 is held until chunk 1 is copied)', async () => {

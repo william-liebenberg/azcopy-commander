@@ -12,6 +12,7 @@ import { UsageError } from '../errors.js';
 import { Secrets } from './secrets.js';
 import { MigrationDashboard } from './migration-dashboard.js';
 import { migrateCommandLine } from './command-line.js';
+import { carriedKinds } from '../migration-view.js';
 import { fit } from './style.js';
 
 export { fit };
@@ -398,7 +399,7 @@ export async function runWizard({ prompts, env = process.env, out = process.stdo
       ['Source', buildSourceUrl(source.bucket, source.prefix, source.region)],
       ['Target', buildTargetBase(target, source.prefix)],
       ['Mode', delta ? `delta, objects modified ${sinceText}` : 'full, everything not already at the target'],
-      ...(carried ? [['Carried', carried.files > 0 ? `${formatCount(carried.files)} file(s) it did not copy, from ${formatCount(carried.fromChunks.length)} chunk(s), ${formatBytes(carried.bytes)}` : 'nothing (it copied everything)']] : []),
+      ...(carried ? [['Carried', carried.files > 0 ? `${formatCount(carried.files)} file(s) it did not copy (${carriedKinds(carried)}), ${formatBytes(carried.bytes)}` : 'nothing (it copied everything)']] : []),
       ['Chunks', `${sizeClasses ? `by size class${sizeProfile ? ` (${sizeProfile})` : ' (defaults)'}, each at most its files per chunk or ${chunkBytes}` : `at most ${chunkFiles} objects or ${chunkBytes} each`}, closed after ${passed.chunkMinutes ?? MIGRATION_DEFAULTS.chunkMinutes} min`],
       ['Copy', `as the chunks close: ${parallel} chunk(s) at once, ${sizeClasses ? 'the objects at once of its size class' : `${concurrency} object(s) at once`} in each${passed.maxAttempts ? `, ${passed.maxAttempts} attempts per chunk` : ''}`],
       ...(passed.stopAfter ? [['Stops', 'after the listing and the analysis: nothing is copied']] : []),

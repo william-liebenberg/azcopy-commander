@@ -200,11 +200,13 @@ runs/state.json                        the start of the last successful migratio
 - `chunks/<id>.jsonl` is the inventory: one object per line, path relative to the prefix. JSON lines, because S3 keys
   may contain tabs.
 - `chunks/skipped.jsonl` lists keys that are not copied: keys with a line break, and archived objects (`GLACIER`,
-  `DEEP_ARCHIVE`) that are not restored. Restored objects are copied as usual.
+  `DEEP_ARCHIVE`) that are not restored. Restored objects are copied as usual; a delta based on the migration carries
+  the archived ones (see [Delta migrations and cutover](#delta-migrations-and-cutover)).
 - The objects in the Archive Access and Deep Archive Access tiers of S3 Intelligent-Tiering are listed as
   `INTELLIGENT_TIERING`, like readable ones: the copy finds them with its HEAD, and lists them, not restored, in the
   attempt's `archived-<ts>.jsonl` (the lines of `skipped.jsonl`, reason `archived (ARCHIVE_ACCESS)` or
-  `archived (DEEP_ARCHIVE_ACCESS)`). The migration summary counts them with the other archived objects.
+  `archived (DEEP_ARCHIVE_ACCESS)`). The migration summary counts them with the other archived objects. The copy also
+  finds the carried archived objects of a delta that are still not restored (reason `archived (GLACIER)`, for example).
 
 No secret is written anywhere: the SAS URL, the AWS keys and the presigned URLs stay in memory, and the SAS signature
 and AWS secrets are redacted from logs and console output.
@@ -230,12 +232,18 @@ then prints a summary of the rounds and the cutover command. A round that fails 
 ```text
 Migration: runs\20261115T090000Z-delta-migration
 Delta:     objects modified on/after 2026-11-12T01:50:00Z (start of runs\20261112T020000Z-migration, minus 10 min)
-Carried:   1,204 file(s) that runs\20261112T020000Z-migration did not copy (2 chunk(s)), 3.10 GiB, in the first chunk(s)
+Carried:   1,204 file(s) that runs\20261112T020000Z-migration did not copy (failed in 2 chunk(s), 200 archived), 3.10 GiB, in the first chunk(s)
 ```
 
 - **Carried files.** With `--last-copy-date auto` (or a baseline picked in the wizard), the delta starts with the failed
-  files of the baseline's exhausted chunks, as its first chunks, before the listing starts. A file that fails again is
-  carried into the next delta. An explicit date carries nothing.
+  files of the baseline's exhausted chunks and its archived objects (`skipped.jsonl` and the `archived-*.jsonl` of its
+  attempts), as its first chunks, before the listing starts. A file that fails again is carried into the next delta.
+  An explicit date carries nothing.
+- **Archived objects.** An S3 restore does not change an object's last-modified time, so a delta's listing never finds
+  an archived object restored since: carrying it is its way back. Restore the archived objects, then run a delta based
+  on the migration. The copy checks each carried archived object with a HEAD; one still not restored is reported as
+  archived again and carried into the next delta. When you do not mean to restore them, a delta with an explicit date
+  ends the carrying.
 - **What a delta costs.** S3 cannot filter by date on the server, so every delta **lists the whole prefix** and filters
   as it goes: a delta takes at least as long as a full listing. This is why `--repeat-until` defaults to 10,000 rather
   than 0, and why the last step is to stop the writers.
@@ -320,8 +328,8 @@ Secrets typed in the wizard stay in memory for the run only; the wizard never of
   them copied only 860-1,020 objects/s, for 3.6-4 ms of CPU per object.
 - **Start-up**: the first chunk closes after its class's files per chunk or `--chunk-minutes`, so copying starts within
   minutes. The total size and the ETA are known only when the listing ends.
-- **Not copied**: keys with a line break, archived objects that are not restored (restore them, then run a delta), and
-  objects modified after the listing passed their key (run a delta).
+- **Not copied**: keys with a line break, archived objects that are not restored (restore them, then run a delta based
+  on the migration: it carries them), and objects modified after the listing passed their key (run a delta).
 - **The bucket must be readable from Azure with a presigned URL**: a bucket policy that limits access by source IP or
   VPC endpoint makes every copy fail with an authorization error.
 - **Temporary credentials**: a presigned URL is valid at most as long as its session token, and a long token can make

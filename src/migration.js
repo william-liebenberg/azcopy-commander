@@ -245,11 +245,15 @@ export function resolveDelta(opts, key, now = new Date()) {
 }
 
 /**
- * What a baseline migration did not copy, for a delta: `{ paths: Map(path -> size), files, bytes, fromChunks, migration }`,
- * or null when `baselineDir` is not a migration folder (a copy run). Only its exhausted chunks count:
+ * What a baseline migration did not copy, for a delta: `{ paths: Map(path -> size), files, bytes, fromChunks, archived,
+ * migration }`, or null when `baselineDir` is not a migration folder (a copy run).
+ * The failed files of its exhausted chunks (`fromChunks`: their ids):
  *   last outcome partial   the paths in the failed-*.jsonl of the chunk's last run, with their sizes
  *   last outcome failed    the whole chunk list (what it did copy is ignored, since copying is append-only); a list of
  *                          paths (format 1) has no sizes, so the chunk's bytes are spread over it
+ * And its archived objects (`archived`: how many of the paths): the lines of chunks/skipped.jsonl with the reason
+ * `archived (...)`, and the archived-*.jsonl of every attempt. A delta would not list them again once restored: an S3
+ * restore does not change the last-modified time.
  * Both formats are read: the chunks of a migration made with azcopy are lists of paths (.txt), the others JSON lines.
  */
 export function collectCarried(baselineDir) {
@@ -270,9 +274,19 @@ export function collectCarried(baselineDir) {
     }
     if (paths.size > before) fromChunks.push(c.id);
   }
+  const failed = paths.size;
+  for (const r of archivedRecords(baselineDir, migration)) if (!paths.has(r.path)) paths.set(r.path, Number(r.size) || 0);
   let bytes = 0;
   for (const size of paths.values()) bytes += size;
-  return { paths, files: paths.size, bytes, fromChunks, migration };
+  return { paths, files: paths.size, bytes, fromChunks, archived: paths.size - failed, migration };
+}
+
+/** The records ({ path, size, reason, ... }) of the archived objects of a migration: skipped.jsonl, then the archived-*.jsonl of its attempts. */
+function archivedRecords(dir, migration) {
+  const skipped = readChunkRecords(path.join(dir, 'chunks', 'skipped.jsonl')).filter((r) => String(r.reason).startsWith('archived'));
+  const runs = (migration.chunks ?? []).flatMap((c) => c.runs ?? []).map((run) => path.join(dir, run)).filter((run) => fs.existsSync(run));
+  const atCopy = runs.flatMap((run) => fs.readdirSync(run).filter((f) => /^archived-.*\.jsonl$/.test(f)).flatMap((f) => readChunkRecords(path.join(run, f))));
+  return [...skipped, ...atCopy];
 }
 
 /** A new migration folder: <ts>-migration, or <ts>-delta-migration; a later second when the name is taken. */
@@ -436,7 +450,7 @@ async function runOneMigration(opts, out) {
     // The files the baseline migration did not copy come along, when it copied the same source to the same target.
     const from = baseline ? collectCarried(baseline.dir) : null;
     const carried = from && from.files > 0 && from.migration.sourceBase === sourceBase && from.migration.destBase === destBase
-      ? { files: from.files, bytes: from.bytes, fromChunks: from.fromChunks }
+      ? { files: from.files, bytes: from.bytes, fromChunks: from.fromChunks, archived: from.archived }
       : null;
     dir = newMigrationDir(opts, startedAt, Boolean(includeAfter));
     m = {

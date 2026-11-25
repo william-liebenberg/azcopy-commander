@@ -46,12 +46,16 @@ function counter() {
   return c;
 }
 
+/** The Restore of a HEAD: `headRestore`, or the RestoreStatus of the listing as S3 writes it in the header. */
+const headRestore = (o) => o.headRestore ?? (o.restore ? `ongoing-request="${o.restore.IsRestoreInProgress}"${o.restore.RestoreExpiryDate ? `, expiry-date="${new Date(o.restore.RestoreExpiryDate).toUTCString()}"` : ''}` : undefined);
+
 const encodeKey = (key) => key.split('/').map(encodeURIComponent).join('/');
 
 /**
  * A fake S3 bucket. `objects` maps a key to { size, lastModified, storageClass, restore, metadata, contentType,
  * archiveStatus, headRestore } (`restore`: the RestoreStatus of the listing; `archiveStatus` and `headRestore`: the
- * ArchiveStatus and Restore of the HEAD; a source with `archiveStatus` and no `headRestore` cannot be read by Azure).
+ * ArchiveStatus and Restore of the HEAD, `headRestore` taken from `restore` when not given; an object with
+ * `archiveStatus` or of an archive class that is not restored cannot be read by Azure).
  *   s3.pages             the ListObjectsV2 params of each page asked for
  *   s3.heads             the keys HEAD was asked for
  *   s3.beforePage(n, params)   awaited before page n (0-based) is answered: a test holds the listing with it
@@ -111,8 +115,9 @@ export function fakeS3(objects = {}, { pageSize, region = 'ap-southeast-2' } = {
           LastModified: new Date(o.lastModified),
           ContentType: o.contentType ?? 'application/octet-stream',
           Metadata: o.metadata ?? {},
+          ...(o.storageClass && o.storageClass !== 'STANDARD' ? { StorageClass: o.storageClass } : {}),
           ...(o.archiveStatus ? { ArchiveStatus: o.archiveStatus } : {}),
-          ...(o.headRestore ? { Restore: o.headRestore } : {}),
+          ...(headRestore(o) ? { Restore: headRestore(o) } : {}),
         };
       });
     },
@@ -143,7 +148,7 @@ export function fakeContainer(s3) {
     const key = decodeURIComponent(u.pathname.slice(1));
     const o = s3.store.get(key);
     if (!o) throw httpError(404, 'CannotVerifyCopySource');
-    if (o.archiveStatus && !o.headRestore) throw httpError(403, 'CannotVerifyCopySource'); // S3: 403 InvalidObjectState
+    if ((o.archiveStatus || ['GLACIER', 'DEEP_ARCHIVE'].includes(o.storageClass)) && !/ongoing-request="false"/.test(headRestore(o) ?? '')) throw httpError(403, 'CannotVerifyCopySource'); // S3: 403 InvalidObjectState
     return { key, o };
   };
   const check = (name, conditions = {}) => {

@@ -23,7 +23,7 @@ export class InventoryAborted extends Error {}
 /**
  * Archive classes: an object in one of them cannot be read (or copied) until it is restored. The archive tiers of S3
  * Intelligent-Tiering are not among them: their objects are listed as INTELLIGENT_TIERING, and only a HEAD tells
- * them apart, so the copy skips them (see archiveTierOf in blob-copy.js).
+ * them apart, so the copy skips them (see archiveStatusOf in blob-copy.js).
  */
 export const ARCHIVE_CLASSES = new Set(['GLACIER', 'DEEP_ARCHIVE']);
 
@@ -209,7 +209,7 @@ export function analysisLines(summary, { shownPrefixes = 5 } = {}) {
     lines.push(`storage    ${summary.storageClasses.map((c) => `${c.storageClass} ${formatCount(c.files)}`).join(' · ')}`);
   }
   if (summary.archived) {
-    lines.push(`WARNING: ${formatCount(summary.archived.files)} archived object(s) (${formatBytes(summary.archived.bytes)}, GLACIER / DEEP_ARCHIVE, not restored) are skipped: restore them, then run a delta migration.`);
+    lines.push(`WARNING: ${formatCount(summary.archived.files)} archived object(s) (${formatBytes(summary.archived.bytes)}, GLACIER / DEEP_ARCHIVE, not restored) are skipped: restore them; a delta based on this migration (--last-copy-date auto) carries them.`);
   }
   return lines;
 }

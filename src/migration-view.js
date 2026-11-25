@@ -183,6 +183,9 @@ export function chunkEndLine(c, { throughput = true } = {}) {
 const TITLES = { success: 'Migration completed', partial: 'Migration completed with failed files', failed: 'Migration failed', interrupted: 'Migration interrupted', stopped: 'Migration stopped' };
 export const migrationTitle = (outcome) => TITLES[outcome] ?? outcome;
 
+/** Where carried files come from (`carried` of migration.json, or collectCarried): `failed in 2 chunk(s), 204 archived`. */
+export const carriedKinds = (c) => [c.fromChunks.length > 0 ? `failed in ${formatCount(c.fromChunks.length)} chunk(s)` : '', num(c.archived) > 0 ? `${formatCount(c.archived)} archived` : ''].filter(Boolean).join(', ');
+
 /**
  * What makes a migration a delta, as [label, text] pairs (none for a full migration): the date and where it came
  * from, and the files carried over from the baseline. `m` has `includeAfter`, `baseline` and `carried` (migration.json).
@@ -194,14 +197,15 @@ export function deltaLines(m) {
   const c = m.carried;
   if (c) {
     const where = c.chunks === undefined ? 'in the first chunk(s)' : `in ${formatCount(c.chunks)} chunk(s)${c.inListing ? `, ${formatCount(c.inListing)} of them modified since (copied from their carried chunk)` : ''}`;
-    lines.push(['Carried', `${formatCount(c.files)} file(s) that ${m.baseline.dir} did not copy (${formatCount(c.fromChunks.length)} chunk(s)), ${formatBytes(c.bytes)}, ${where}`]);
+    lines.push(['Carried', `${formatCount(c.files)} file(s) that ${m.baseline.dir} did not copy (${carriedKinds(c)}), ${formatBytes(c.bytes)}, ${where}`]);
   }
   return lines;
 }
 
 /**
  * Where the keys not copied are listed: skipped.jsonl (by the listing), and the archived-*.jsonl of the chunk folders
- * (`archivedAtCopy`: the objects in an archive tier of S3 Intelligent-Tiering, found by the copy).
+ * (`archivedAtCopy`: the archived objects found by the copy: in an archive tier of S3 Intelligent-Tiering, or carried
+ * by a delta and still not restored).
  */
 export function skippedWhere(result) {
   const atCopy = num(result.archivedAtCopy);
